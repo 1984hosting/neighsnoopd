@@ -1,0 +1,16 @@
+[Unit]
+Description=Snoops for ARP replies and adds local neighbors
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/neighsnoopd %I
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+
+# Enable the service by enabling it with the desired bridge name after the @, e.g.:
+# systemctl enable neighsnoopd@br_default.service
+# systemctl start neighsnoopd@br_default.service
