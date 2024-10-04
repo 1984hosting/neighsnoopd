@@ -89,6 +89,8 @@ static const struct argp_option opts[] = {
     { "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
     { "xdp", 'x', NULL, 0, "Attach XDP instead of TC. This option only works"
       "on devices with a VLAN header on the packets available to XDP.", 0},
+    { "disable_ipv6ll_filter", 'l', NULL, 0,
+      "Disable the default IPv6 link-local filter", 0},
     { NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
     {},
 };
@@ -558,6 +560,14 @@ static int handle_neighbor_reply(void *ctx, void *data, size_t data_sz)
 
     pr_debug("Received Neighbor Reply MAC: %s - IP: %s\n", cache.mac_str,
              cache.ip_str);
+
+    if (!env.disable_ipv6ll_filter &
+        (cache.neighbor_reply->in_family == AF_INET6)) {
+        if (IN6_IS_ADDR_LINKLOCAL(&cache.neighbor_reply->ip)) {
+            pr_debug("Neighbor IP '%s' is IPv6 link-local: filtered\n", cache.ip_str);
+            return 1;
+        }
+    }
 
     if (!find_ifindex_from_ip(&cache)) {
         pr_debug("No interface mached destination: filtered\n");

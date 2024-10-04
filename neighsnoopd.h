@@ -34,6 +34,7 @@ struct env {
     bool has_count;
     int count;
     bool netlink;
+    bool disable_ipv6ll_filter;
 };
 
 void mac_to_string(__u8 *buffer, const __u8 *mac, size_t buffer_size);
