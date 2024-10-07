@@ -12,6 +12,8 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <signal.h>
+#include <sys/signalfd.h>
+#include <sys/epoll.h>
 #include <argp.h>
 #include <time.h>
 #include <ifaddrs.h>
@@ -55,8 +57,6 @@ struct lookup_cache {
         char network_str[INET6_ADDRSTRLEN];
     } debug;
 };
-
-static volatile sig_atomic_t exiting = 0;
 
 static __u32 nlm_seq;
 struct mnl_socket *nl;
@@ -599,16 +599,344 @@ static int handle_neighbor_reply(void *ctx, void *data, size_t data_sz)
     return 0;
 }
 
-static void sig_handler(int sig)
+static int handle_signal(void)
 {
-    exiting = true;
+    int err = 0;
+    struct signalfd_siginfo fdsi;
+    ssize_t s;
+
+    s = read(env.signal_fd, &fdsi, sizeof(struct signalfd_siginfo));
+    if (s != sizeof(struct signalfd_siginfo)) {
+        pr_err(errno, "read");
+        err = errno;
+        goto out;
+    }
+
+    if (fdsi.ssi_signo == SIGINT || fdsi.ssi_signo == SIGTERM) {
+        err = 1;
+    }
+
+out:
+    return err;
 }
 
+static int handle_netlink(void)
+{
+    // TODO: Move all Netlink logic to this function
+    // This function will be responsible for monitoring all Netlink messages
+    // and update the eBPF code accordingly.
+    return 0;
+}
+
+static int handle_ring_buffer(void)
+{
+    int err;
+
+    err = ring_buffer__consume(env.ringbuf);
+    if (err < 0) {
+        pr_err(err, "bpf_ringbuf_consume");
+        goto out;
+    }
+    err = 0; // The return value is the number of consumed records
+
+out:
+    return err;
+}
+
+static void main_loop(void)
+{
+    struct epoll_event events[env.number_of_fds];
+
+    while (true) {
+        int n = epoll_wait(env.epoll_fd, events, env.number_of_fds, -1);
+        if (n == -1) {
+            if (errno == EINTR)
+                continue; // Ignore interrupted by signal
+            pr_err(errno, "epoll_wait");
+            return; // Failure
+        }
+
+        /*
+         * We priorities the events from epoll as follows:
+         * 1. Signal events
+         * 2. Netlink events
+         * 3. BPF ring buffer events
+         */
+
+        // Signal events
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == env.signal_fd) {
+                if (handle_signal())
+                    return; // Failure or exiting
+            }
+        }
+
+        // Netlink events
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == env.nl_fd) {
+                if (handle_netlink())
+                    return; // Failure
+            }
+        }
+
+        // BPF ring buffer events
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == env.ringbuf_fd) {
+                if (handle_ring_buffer())
+                    return; // Failure
+            }
+        }
+    }
+}
+
+// Signal setup and cleanup
+static int setup_signals(void)
+{
+    int err = 0;
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);  // Handle SIGINT (Ctrl+C)
+    sigaddset(&mask, SIGTERM); // Handle SIGTERM
+
+    // Block these signals so they can be handled via signalfd
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+        perror("sigprocmask");
+        err = errno;
+        goto out;
+    }
+
+    // Create a signalfd to receive the signals
+    env.signal_fd = signalfd(-1, &mask, 0);
+    if (env.signal_fd == -1) {
+        perror("signalfd");
+        err = errno;
+        goto out;
+    }
+
+    env.number_of_fds++;
+
+out:
+    return err;
+}
+
+static void cleanup_signals(void)
+{
+    if (env.signal_fd >= 0)
+        close(env.signal_fd);
+}
+
+// Netlink setup and cleanup
+static int setup_netlink(void)
+{
+    int err = 0;
+
+    nlm_seq = time(NULL);
+    if (err) {
+        fprintf(stderr, "Could not compile regex");
+        goto out;
+    }
+
+    nl = mnl_socket_open(NETLINK_ROUTE);
+    if (nl == NULL) {
+        err = errno;
+        perror("mnl_socket_open");
+        goto out;
+    }
+    mnl_portid = mnl_socket_get_portid(nl);
+    pr_nl("MNL port ID: %d\n", mnl_portid);
+
+    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
+        err = -errno;
+        perror("mnl_socket_bind");
+        goto out;
+    }
+
+    env.nl_fd = mnl_socket_get_fd(nl);
+    if (env.nl_fd < 0) {
+        err = env.nl_fd;
+        perror("mnl_socket_get_fd");
+        goto out;
+    }
+    env.number_of_fds++;
+
+out:
+    return err;
+}
+
+static void cleanup_netlink(void)
+{
+    if (nl)
+        mnl_socket_close(nl);
+}
+
+// BPF setup and cleanup
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
     if (level == LIBBPF_DEBUG && !env.debug)
         return 0;
     return vfprintf(stderr, format, args);
+}
+
+static int setup_bpf(void)
+{
+    int err = 0;
+
+    libbpf_set_print(libbpf_print_fn);
+
+    // Open the skeleton
+    env.skel = neighsnoopd_bpf__open();
+    if (!env.skel) {
+        perror("Failed to open BPF skeleton\n");
+        err = errno;
+        env.skel = NULL;
+        goto out;
+    }
+
+    err = neighsnoopd_bpf__load(env.skel);
+    if (err) {
+        perror("Failed to load BPF skeleton\n");
+        err = errno;
+        goto out;
+    }
+
+    // XDP
+    struct bpf_link *xdp_link;
+
+    // TC OPTS
+    LIBBPF_OPTS(bpf_tc_hook, tc_hook,
+                .ifindex = env.ifidx_mon,
+                .attach_point = BPF_TC_INGRESS);
+    LIBBPF_OPTS(bpf_tc_opts, tc_opts,
+                .handle = 1,
+                .priority = 1,
+                .prog_fd = bpf_program__fd(
+                    env.skel->progs.handle_neighbor_reply_tc));
+
+    env.tc_opts = tc_opts;
+    env.tc_hook = tc_hook;
+
+    if (!env.fail_on_qfilter_present)
+        env.tc_opts.flags |= BPF_TC_F_REPLACE;
+
+    if (env.is_xdp) {
+        // attach xdp program to interface
+        xdp_link = bpf_program__attach_xdp(
+            env.skel->progs.handle_neighbor_reply_xdp, env.ifidx_mon);
+        if (!xdp_link) {
+            perror("Failed to attach XDP hook");
+            goto out;
+        }
+    } else {
+        // Load TC hook instead of XDP
+        // Attach the BPF program to the clsact qdisc for ingress
+
+        /*
+         * The TC Qdisc hook may already exist because:
+         * 1. Other processes or users create it.
+         * 2. By attaching to the TC ingress, the bpf_tc_hook_destroy does not
+         * remove the Qdisc and may leave an egress filter in place since the last
+         * invocation of the program.
+         */
+        err = bpf_tc_hook_create(&env.tc_hook);
+        if (err && err != -EEXIST) {
+            perror("Failed to create TC hook");
+            goto out;
+        }
+
+        if (bpf_tc_attach(&env.tc_hook, &env.tc_opts)) {
+            perror("Failed to attach TC hook");
+            goto out;
+        }
+    }
+    err = 0;
+
+    // Parse Neighbor replies
+    struct bpf_map *ringbuf_map =
+        bpf_object__find_map_by_name(env.skel->obj, "neighbor_ringbuf");
+
+    env.ringbuf = ring_buffer__new(bpf_map__fd(ringbuf_map),
+                                              handle_neighbor_reply, NULL, NULL);
+    if (!env.ringbuf) {
+        perror("Failed to create ring buffer");
+        err = errno;
+        goto out;
+    }
+
+    env.ringbuf_fd = bpf_map__fd(ringbuf_map);
+    if (env.ringbuf_fd < 0) {
+        perror("Failed to get ringbuf map fd");
+        err = env.ringbuf_fd;
+        goto out;
+    }
+
+out:
+    return err;
+}
+
+static void cleanup_bpf(void)
+{
+    int err;
+    if (env.ringbuf_fd >= 0)
+        close(env.ringbuf_fd);
+
+    env.tc_opts.flags = env.tc_opts.prog_fd = env.tc_opts.prog_id = 0;
+    if (!env.is_xdp) {
+        pr_debug("Detaching the TC hook\n");
+        err = bpf_tc_detach(&env.tc_hook, &env.tc_opts);
+        if (err)
+            perror("Failed to detach TC hook\n");
+    } else {
+        pr_debug("Destroying the TC hook\n");
+        err = bpf_tc_hook_destroy(&env.tc_hook);
+        if (err)
+            perror("Failed to destroy TC hook");
+    }
+    neighsnoopd_bpf__destroy(env.skel);
+}
+
+// epoll setup and cleanup
+static int setup_epoll(void)
+{
+    int err;
+    struct epoll_event event;
+
+    env.epoll_fd = epoll_create1(0);
+
+    // Add signalfd to epoll
+    event.events = EPOLLIN;
+    event.data.fd = env.signal_fd;
+    if (epoll_ctl(env.epoll_fd, EPOLL_CTL_ADD, env.signal_fd, &event) == -1) {
+        perror("epoll_ctl: signal_fd");
+        err = errno;
+        goto out;
+    }
+
+    // Add netlink socket to epoll
+    event.events = EPOLLIN;
+    event.data.fd = env.nl_fd;
+    if (epoll_ctl(env.epoll_fd, EPOLL_CTL_ADD, env.nl_fd, &event) == -1) {
+        perror("epoll_ctl: nl_fd");
+        err = errno;
+        goto out;
+    }
+
+    // Add BPF ring buffer to epoll
+    event.events = EPOLLIN;
+    event.data.fd = env.ringbuf_fd;
+    if (epoll_ctl(env.epoll_fd, EPOLL_CTL_ADD, env.ringbuf_fd, &event) == -1) {
+        perror("epoll_ctl: ringbuf_fd");
+        err = errno;
+        goto out;
+    }
+
+out:
+    return err;
+}
+
+static void cleanup_epoll(void)
+{
+    if (env.epoll_fd >= 0)
+        close(env.epoll_fd);
 }
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
@@ -706,8 +1034,8 @@ static void short_usage(FILE *fp, struct argp_state *state)
 
 int main(int argc, char **argv)
 {
-    struct neighsnoopd_bpf *skel;
     int err;
+
     static const struct argp argp = {
         .options = opts,
         .parser = parse_arg,
@@ -715,151 +1043,50 @@ int main(int argc, char **argv)
         .args_doc = "<IFNAME_MON>",
     };
 
-    nlm_seq = time(NULL);
-
     err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
-    if (err)
+    if (err) {
+        err = EXIT_FAILURE;
         goto cleanup1;
+    }
 
-    err = 0;
-    if (env.has_filter)
+    if (env.has_filter) {
         err = regcomp(&env.regex_filter, env.regexp_filter_ifname, REG_EXTENDED);
-
-    if (err) {
-        fprintf(stderr, "Could not compile regex");
-        goto cleanup1;
-    }
-
-    libbpf_set_print(libbpf_print_fn);
-
-    nl = mnl_socket_open(NETLINK_ROUTE);
-    if (nl == NULL) {
-        err = errno;
-        perror("mnl_socket_open");
-        goto cleanup1;
-    }
-    mnl_portid = mnl_socket_get_portid(nl);
-    pr_nl("MNL port ID: %d\n", mnl_portid);
-
-    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-        err = -errno;
-        perror("mnl_socket_bind");
-        goto cleanup2;
-    }
-
-    // Open the skeleton
-    skel = neighsnoopd_bpf__open();
-    if (!skel) {
-        perror("Failed to open BPF skeleton\n");
-        err = EXIT_FAILURE;
-        goto cleanup2;
-    }
-
-    err = neighsnoopd_bpf__load(skel);
-    if (err) {
-        perror("Failed to load BPF skeleton\n");
-        err = EXIT_FAILURE;
-        goto cleanup2;
-    }
-
-    // XDP
-    struct bpf_link *xdp_link;
-
-    // TC OPTS
-    LIBBPF_OPTS(bpf_tc_hook, tc_hook,
-                .ifindex = env.ifidx_mon,
-                .attach_point = BPF_TC_INGRESS);
-    LIBBPF_OPTS(bpf_tc_opts, tc_opts,
-                .handle = 1,
-                .priority = 1,
-                .prog_fd = bpf_program__fd(
-                    skel->progs.handle_neighbor_reply_tc));
-
-    if (!env.fail_on_qfilter_present)
-        tc_opts.flags |= BPF_TC_F_REPLACE;
-
-    bool hook_created = false;
-    if (env.is_xdp) {
-        // attach xdp program to interface
-        xdp_link = bpf_program__attach_xdp(
-            skel->progs.handle_neighbor_reply_xdp, env.ifidx_mon);
-        if (!xdp_link) {
-            perror("Failed to attach XDP hook");
-            goto cleanup3;
+        if (err) {
+            perror("Failed to compile regular expression");
+            err = EXIT_FAILURE;
+            goto cleanup1;
         }
-    } else {
-        // Load TC hook instead of XDP
-        // Attach the BPF program to the clsact qdisc for ingress
-
-        /*
-         * The TC Qdisc hook may already exist because:
-         * 1. Other processes or users create it.
-         * 2. By attaching to the TC ingress, the bpf_tc_hook_destroy does not
-         * remove the Qdisc and may leave an egress filter in place since the last
-         * invocation of the program.
-         */
-        err = bpf_tc_hook_create(&tc_hook);
-        if (!err)
-            hook_created = true;
-        if (err && err != -EEXIST)
-            goto cleanup3;
-
-        if (bpf_tc_attach(&tc_hook, &tc_opts))
-            goto cleanup4;
     }
 
-    // Parse Neighbor replies
-    struct bpf_map *ringbuf_map =
-        bpf_object__find_map_by_name(skel->obj, "neighbor_ringbuf");
-
-    struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(ringbuf_map),
-                                              handle_neighbor_reply, NULL, NULL);
-    if (!rb) {
-        fprintf(stderr, "Failed to create ring buffer");
-        goto cleanup5;
+    if (setup_signals()) {
+        err = EXIT_FAILURE;
+        goto cleanup1;
     }
-
-    if (signal(SIGINT, sig_handler) == SIG_ERR) {
-        err = errno;
-        perror("Can't set signal handler");
-        goto cleanup6;
+    if (setup_netlink()) {
+        err = EXIT_FAILURE;
+        goto cleanup2;
+    }
+    if (setup_bpf()) {
+        err = EXIT_FAILURE;
+        goto cleanup3;
+    }
+    if (setup_epoll()) {
+        err = EXIT_FAILURE;
+        goto cleanup4;
     }
 
     // Main loop
-    while (!exiting) {
-        int err = ring_buffer__poll(rb, -1);
-        if (err < 0) {
-            fprintf(stderr, "Error polling ring buffer");
-            break;
-        }
-        if (env.has_count && env.count == 0)
-            break;
-    }
-    err = 0;
+    main_loop();
 
     // Cleanup
-cleanup6:
-    ring_buffer__free(rb);
-    close(bpf_map__fd(ringbuf_map));
-cleanup5:
-    tc_opts.flags = tc_opts.prog_fd = tc_opts.prog_id = 0;
-    if (!env.is_xdp) {
-        pr_debug("Detaching the TC hook\n");
-        err = bpf_tc_detach(&tc_hook, &tc_opts);
-        if (err)
-            perror("Failed to detach TC hook\n");
-    }
 cleanup4:
-    if (hook_created) {
-        pr_debug("Destroying the TC hook\n");
-        err = bpf_tc_hook_destroy(&tc_hook);
-        if (err)
-            perror("Failed to destroy TC hook");
-    }
+    cleanup_epoll();
 cleanup3:
-    neighsnoopd_bpf__destroy(skel);
+    cleanup_bpf();
 cleanup2:
-    mnl_socket_close(nl);
+    cleanup_netlink();
 cleanup1:
-    return -err;
+    cleanup_signals();
+
+    return err;
 }

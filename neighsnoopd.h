@@ -13,7 +13,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <regex.h>
-
+#include <bpf/libbpf.h>
 #include <libmnl/libmnl.h>
 
 #define MAC_ADDR_STR_LEN 18
@@ -35,6 +35,20 @@ struct env {
     int count;
     bool netlink;
     bool disable_ipv6ll_filter;
+
+    // Event file descriptors
+    int signal_fd;
+    int nl_fd;
+    int ringbuf_fd;
+    int epoll_fd;
+    int number_of_fds;
+
+    struct ring_buffer *ringbuf;
+
+    // Setup and Cleanup states
+    struct neighsnoopd_bpf *skel;
+    struct bpf_tc_hook tc_hook;
+    struct bpf_tc_opts tc_opts;
 };
 
 void mac_to_string(__u8 *buffer, const __u8 *mac, size_t buffer_size);
