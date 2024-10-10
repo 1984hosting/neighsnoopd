@@ -8,6 +8,8 @@ VERSION_FILE = version.in.h
 GIT_COMMIT_HASH = $(shell git rev-parse --short HEAD)
 VERSION_DEFINE = "\#define GIT_COMMIT \"$(GIT_COMMIT_HASH)\""
 
+GLIB_CFLAGS = $(shell pkg-config --cflags --libs glib-2.0)
+
 all: neighsnoopd
 
 neighsnoopd.bpf.c:
@@ -21,8 +23,8 @@ neighsnoopd.bpf.skel.h: neighsnoopd.bpf.o
 $(VERSION_FILE):
 	@echo $(VERSION_DEFINE) > $(VERSION_FILE)
 
-neighsnoopd: neighsnoopd.bpf.skel.h neighsnoopd.c neighsnoopd.h neighsnoopd_shared.h $(VERSION_FILE)
-	gcc -g -Wall -o neighsnoopd neighsnoopd.c lib.c logging.c -lbpf -lmnl
+neighsnoopd: neighsnoopd.bpf.skel.h neighsnoopd.c neighsnoopd.h neighsnoopd_shared.h netlink.c cache.c lib.c $(VERSION_FILE)
+	gcc -g -Wall -o neighsnoopd -D_GNU_SOURCE -I./include neighsnoopd.c netlink.c cache.c lib.c logging.c -lbpf -lmnl $(GLIB_CFLAGS)
 
 clean:
 	rm -f neighsnoopd.bpf.o neighsnoopd.bpf.skel.h neighsnoopd cscope.in.out cscope.out cscope.po.out $(VERSION_FILE)

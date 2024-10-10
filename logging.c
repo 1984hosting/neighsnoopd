@@ -16,6 +16,7 @@
 #include "neighsnoopd.h"
 
 extern struct env env;
+extern struct nl_env nl_env;
 
 void __pr_std(FILE * file, const char *format, ...)
 {
@@ -29,82 +30,99 @@ int pr_nl_attr_link(const struct nlattr *attr, void *data)
 {
     int type = mnl_attr_get_type(attr);
     char ip_str[INET6_ADDRSTRLEN];
+    const char *ifname;
+    const unsigned char *addr;
+    const unsigned char *broadcast;
+    uint32_t mtu;
+    uint8_t operstate;
+    uint8_t linkmode;
+    uint32_t link;
+    const struct rtnl_link_stats *stats;
+    const char *qdisc;
+    uint8_t carrier;
+    uint32_t master;
+    uint32_t num_tx_queues;
+    uint32_t num_rx_queues;
+    struct nlattr *nested_attr;
+    int nested_type;
+    const char *kind;
+    uint32_t gso_max_segs;
+    uint32_t gso_max_size;
 
     // Print the basic info of the attribute
     __pr_nl(">  [ATTR %d] %d octets", type, mnl_attr_get_len(attr));
 
     switch (type) {
         case IFLA_IFNAME:
-            const char *ifname = mnl_attr_get_str(attr);
+            ifname = mnl_attr_get_str(attr);
             __pr_nl(" <IFNAME> %s", ifname);
             break;
         case IFLA_ADDRESS:
-            const unsigned char *addr = mnl_attr_get_payload(attr);
+            addr = mnl_attr_get_payload(attr);
             format_ip_address(ip_str, sizeof(ip_str), (struct in6_addr *)addr);
             __pr_nl(" <ADDRESS> %s", ip_str);
             break;
         case IFLA_BROADCAST:
-            const unsigned char *broadcast = mnl_attr_get_payload(attr);
+            broadcast = mnl_attr_get_payload(attr);
             __pr_nl(" <BROADCAST> %02x:%02x:%02x:%02x:%02x:%02x",
                     broadcast[0], broadcast[1], broadcast[2], broadcast[3],
                     broadcast[4], broadcast[5]);
             break;
         case IFLA_MTU:
-            uint32_t mtu = mnl_attr_get_u32(attr);
+            mtu = mnl_attr_get_u32(attr);
             __pr_nl(" <MTU> %u", mtu);
             break;
         case IFLA_OPERSTATE:
-            uint8_t operstate = mnl_attr_get_u8(attr);
+            operstate = mnl_attr_get_u8(attr);
             __pr_nl(" <OPERSTATE> %u", operstate);
             break;
         case IFLA_LINKMODE:
-            uint8_t linkmode = mnl_attr_get_u8(attr);
+            linkmode = mnl_attr_get_u8(attr);
             __pr_nl(" <LINKMODE> %u", linkmode);
             break;
         case IFLA_LINK:
-            uint32_t link = mnl_attr_get_u32(attr);
+            link = mnl_attr_get_u32(attr);
             __pr_nl(" <LINK> %u", link);
             break;
         case IFLA_STATS:
             // Assume statistics as a payload (like struct rtnl_link_stats)
-            const struct rtnl_link_stats *stats = mnl_attr_get_payload(attr);
+            stats = mnl_attr_get_payload(attr);
             __pr_nl(" <STATS> RX packets: %u, TX packets: %u",
                     stats->rx_packets, stats->tx_packets);
             break;
         case IFLA_QDISC:
-            const char *qdisc = mnl_attr_get_str(attr);
+            qdisc = mnl_attr_get_str(attr);
             __pr_nl(" <QDISC> %s", qdisc);
             break;
         case IFLA_CARRIER:
-            uint8_t carrier = mnl_attr_get_u8(attr);
+            carrier = mnl_attr_get_u8(attr);
             __pr_nl(" <CARRIER> %u", carrier);
             break;
         case IFLA_MASTER:
-            uint32_t master = mnl_attr_get_u32(attr);
+            master = mnl_attr_get_u32(attr);
             __pr_nl(" <MASTER> %u", master);
             break;
         case IFLA_NUM_TX_QUEUES:
-            uint32_t num_tx_queues = mnl_attr_get_u32(attr);
+            num_tx_queues = mnl_attr_get_u32(attr);
             __pr_nl(" <NUM_TX_QUEUES> %u", num_tx_queues);
             break;
         case IFLA_NUM_RX_QUEUES:
-            uint32_t num_rx_queues = mnl_attr_get_u32(attr);
+            num_rx_queues = mnl_attr_get_u32(attr);
             __pr_nl(" <NUM_RX_QUEUES> %u", num_rx_queues);
             break;
         case IFLA_LINKINFO:
             __pr_nl(" <LINKINFO> NESTED");
 
             // Parse the nested attributes
-            struct nlattr *nested_attr;
             mnl_attr_for_each_nested(nested_attr, attr) {
-                int nested_type = mnl_attr_get_type(nested_attr);
+                nested_type = mnl_attr_get_type(nested_attr);
 
                 __pr_nl("\n> [NESTED ATTR %d] %d octets", nested_type,
                         mnl_attr_get_len(nested_attr));
 
                 switch (nested_type) {
                     case IFLA_INFO_KIND: {
-                        const char *kind = mnl_attr_get_str(nested_attr);
+                        kind = mnl_attr_get_str(nested_attr);
                         __pr_nl(" <INFO_KIND> %s", kind);
                         break;
                     }
@@ -126,11 +144,11 @@ int pr_nl_attr_link(const struct nlattr *attr, void *data)
                 }
             }
         case IFLA_GSO_MAX_SEGS:
-            uint32_t gso_max_segs = mnl_attr_get_u32(attr);
+            gso_max_segs = mnl_attr_get_u32(attr);
             __pr_nl(" <GSO_MAX_SEGS> %u", gso_max_segs);
             break;
         case IFLA_GSO_MAX_SIZE:
-            uint32_t gso_max_size = mnl_attr_get_u32(attr);
+            gso_max_size = mnl_attr_get_u32(attr);
             __pr_nl(" <GSO_MAX_SIZE> %u", gso_max_size);
             break;
         default:
@@ -205,6 +223,7 @@ int pr_nl_link(const struct nlmsghdr *nlh)
 int pr_nl_attr_neigh(const struct nlattr *attr, void *data)
 {
     int type = mnl_attr_get_type(attr);
+    struct ndmsg *ndm = (struct ndmsg *)data;
     __u8 mac_str[MAC_ADDR_STR_LEN];
     char ip_str[INET6_ADDRSTRLEN];
 
@@ -216,7 +235,10 @@ int pr_nl_attr_neigh(const struct nlattr *attr, void *data)
             break;
         case NDA_DST:
             const unsigned char *addr = mnl_attr_get_payload(attr);
-            format_ip_address(ip_str, sizeof(ip_str), (struct in6_addr *)addr);
+            if (ndm->ndm_family == AF_INET)
+                inet_ntop(AF_INET, addr, ip_str, INET_ADDRSTRLEN);
+            else if (ndm->ndm_family == AF_INET6)
+                format_ip_address(ip_str, sizeof(ip_str), (struct in6_addr *)addr);
             __pr_nl(" <DST> IP: %s", ip_str);
             break;
         case NDA_LLADDR:
@@ -289,23 +311,27 @@ int pr_nl_neigh(const struct nlmsghdr *nlh)
     __pr_nl(">    .ndm_family = %d\n", ndm->ndm_family);
     __pr_nl(">    .ndm_ifindex = %d\n", ndm->ndm_ifindex);
     __pr_nl(">    .ndm_state = <");
-    unsigned states = nlh->nlmsg_flags;
+    unsigned states = ndm->ndm_state;
     while (states) {
         int bit_pos = __builtin_ctzll(states);
         int state = 1 << bit_pos;
-        if (state & NLM_F_REQUEST)
-            __pr_nl("REQUEST");
-        if (state & NLM_F_MULTI)
-            __pr_nl("MULTI");
-        if (state & NLM_F_ACK)
-            __pr_nl("ACK");
-        if (state & NLM_F_ECHO)
-            __pr_nl("ECHO");
-        if (state & NLM_F_DUMP_INTR)
-            __pr_nl("DUMP_INTR");
-        if (state & NLM_F_DUMP_FILTERED)
-            __pr_nl("DUMP_FILTERED");
-        if (state >= NLM_F_DUMP_FILTERED)
+        if (state & NUD_INCOMPLETE)
+            __pr_nl("INCOMPLETE");
+        if (state & NUD_REACHABLE)
+            __pr_nl("REACHABLE");
+        if (state & NUD_STALE)
+            __pr_nl("STALE");
+        if (state & NUD_DELAY)
+            __pr_nl("DELAY");
+        if (state & NUD_PROBE)
+            __pr_nl("PROBE");
+        if (state & NUD_FAILED)
+            __pr_nl("FAILED");
+        if (state & NUD_NOARP)
+            __pr_nl("NOARP");
+        if (state & NUD_PERMANENT)
+            __pr_nl("PERMANENT");
+        if (state > NUD_PERMANENT)
             __pr_nl("UNKNOWN(0x%x)", state);
         if (__builtin_popcountll(states) > 1)
             __pr_nl(",");
@@ -313,7 +339,7 @@ int pr_nl_neigh(const struct nlmsghdr *nlh)
     }
     __pr_nl(">\n");
     __pr_nl(">    .ndm_flags = %d <", ndm->ndm_flags);
-    unsigned flags = nlh->nlmsg_flags;
+    unsigned flags = ndm->ndm_flags;
     while (flags) {
         int bit_pos = __builtin_ctzll(flags);
         int flag = 1 << bit_pos;
@@ -343,7 +369,7 @@ int pr_nl_neigh(const struct nlmsghdr *nlh)
     __pr_nl(">\n");
     __pr_nl(">    .ndm_type = %d\n", ndm->ndm_type);
 
-    mnl_attr_parse(nlh, sizeof(*ndm), pr_nl_attr_neigh, NULL);
+    mnl_attr_parse(nlh, sizeof(*ndm), pr_nl_attr_neigh, ndm);
 
     return MNL_CB_OK;
 }
@@ -390,12 +416,9 @@ int pr_nl_ndm(const struct nlmsghdr *nlh)
     return MNL_CB_OK;
 }
 
-void pr_nl_nlmsg(struct nlmsghdr *nlh, __u32 seq)
+static int __pr_nl_nlmsg_cb(const struct nlmsghdr *nlh, void *data)
 {
     int ret;
-
-    if (!env.netlink)
-        return;
 
     __pr_nl(">----------- BEGIN NETLINK MESSAGE -----------\n");
     __pr_nl(">  [NETLINK Header ] %d octets\n", nlh->nlmsg_len);
@@ -449,7 +472,34 @@ void pr_nl_nlmsg(struct nlmsghdr *nlh, __u32 seq)
             __pr_nl("DUMP_INTR");
         if (flag & NLM_F_DUMP_FILTERED)
             __pr_nl("DUMP_FILTERED");
-        if (flag >= NLM_F_DUMP_FILTERED)
+        if (nlh->nlmsg_type == RTM_NEWNEIGH ||
+            nlh->nlmsg_type == RTM_NEWLINK ||
+            nlh->nlmsg_type == RTM_NEWADDR) {
+            if (flag & NLM_F_ROOT)
+                __pr_nl("ROOT");
+            if (flag & NLM_F_MATCH)
+                __pr_nl("MATCH");
+            if (flag & NLM_F_ATOMIC)
+                __pr_nl("ATOMIC");
+        } else if (nlh->nlmsg_type == RTM_GETNEIGH ||
+                   nlh->nlmsg_type == RTM_GETLINK ||
+                   nlh->nlmsg_type == RTM_GETADDR) {
+            if (flag & NLM_F_REPLACE)
+                __pr_nl("REPLACE");
+            if (flag & NLM_F_EXCL)
+                __pr_nl("EXCL");
+            if (flag & NLM_F_CREATE)
+                __pr_nl("CREATE");
+            if (flag & NLM_F_APPEND)
+                __pr_nl("APPEND");
+        } else if (nlh->nlmsg_type == RTM_DELNEIGH ||
+                   nlh->nlmsg_type == RTM_DELLINK ||
+                   nlh->nlmsg_type == RTM_DELADDR) {
+            if (flag & NLM_F_NONREC)
+                __pr_nl("NONREC");
+            if (flag & NLM_F_BULK)
+                __pr_nl("BULK");
+        } else if (flag >= NLM_F_DUMP_FILTERED)
             __pr_nl("UNKNOWN(0x%x)", flag);
         if (__builtin_popcountll(flags) > 1)
             __pr_nl(",");
@@ -467,7 +517,17 @@ void pr_nl_nlmsg(struct nlmsghdr *nlh, __u32 seq)
         ret = pr_nl_ndm(nlh);
     if (ret <= MNL_CB_ERROR) {
         pr_nl(">>>error parsing netlink message<<<\n");
-        return;
+        return MNL_CB_ERROR;
     }
     __pr_nl(">-----------  END NETLINK MESSAGE  -----------\n");
+    return MNL_CB_OK;
+}
+
+void pr_nl_nlmsg(struct nlmsghdr *nlh, size_t num_bytes)
+{
+    if (!env.netlink)
+        return;
+
+    mnl_cb_run(nlh, num_bytes, nlh->nlmsg_seq, nl_env.mnl_portid,
+                     __pr_nl_nlmsg_cb, NULL);
 }

@@ -4,6 +4,21 @@
 /* SPDX-FileContributor: Freysteinn Alfredsson <freysteinn@freysteinn.com> */
 /* SPDX-FileContributor: Julius Thor Bess Rikardsson <juliusbess@gmail.com> */
 
+/**
+ * @file neighsnoopd.c
+ * @brief The primary file for decision-making and handling.
+ *
+ * This is the primary file for the neighsnoopd program and handles the core
+ * functionality and decision-making. The core part of the program is the epoll
+ * loop, which monitors all events such as POSIX signals, Netlink messages, the
+ * eBPF ring buffer for ARP/ND data extracted by the XDP/TC eBPF code, and
+ * client requests for statistics. The neighsnoopd program is designed to be
+ * single-threaded, relying on file descriptors to manage all the events it
+ * needs to handle.
+ *
+ * @see neighsnoopd.h for the main header data structures and functions.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -19,15 +34,27 @@
 #include <ifaddrs.h>
 #include <regex.h>
 #include <string.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+
+#include <arpa/inet.h>
 
 #include <linux/bpf.h>
+#include <linux/rtnetlink.h>
+#include <linux/ipv6.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
-#include <linux/if_ether.h>
+#include <net/ethernet.h>
+#include <net/if_arp.h>
 
-#include <libmnl/libmnl.h>
-#include <linux/rtnetlink.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip6.h>
+#include <netinet/icmp6.h>
 
 #include "neighsnoopd.h"
 
@@ -37,30 +64,6 @@
 #include "version.in.h"
 
 struct env env = {0};
-
-struct lookup_cache {
-    struct neighbor_reply *neighbor_reply;
-    __u8 mac_str[MAC_ADDR_STR_LEN];
-    __u32 ifindex;
-    char ifname[IFNAMSIZ];
-    __u32 link_ifindex;
-    char kind[128];
-    char ip_str[INET6_ADDRSTRLEN];
-    __u32 cidr;
-
-    // FDB
-    bool is_ext_learned;
-    bool is_macvlan;
-
-    // Debug information for debug mode only
-    struct {
-        char network_str[INET6_ADDRSTRLEN];
-    } debug;
-};
-
-static __u32 nlm_seq;
-struct mnl_socket *nl;
-__u32 mnl_portid;
 
 const char *argp_program_version = "neighsnoopd v0.9\n"
     "Build date: " __DATE__ " " __TIME__ "\n" \
@@ -79,523 +82,408 @@ static const struct argp_option opts[] = {
     { "count", 'c', "NUM", 0, "This option handles a fixed number of ARP or NA"
       "replies before terminating the program."
       "Use this for debugging purposes only", 0 },
-    { "filter", 'f', "REGEXP", 0,
+    { "deny-filter", 'f', "REGEXP", 0,
       "Filters out interfaces with a regular expression exclude from adding to"
-      "the neighbor cache. Example: -f '^br0|.*-v0^'", 0 },
-    { "macvlan", 'm', NULL, 0, "Disable filtering macvlan devices from being"
-      "added to the neighbor cache.", 0 },
+      "the neighbor cache. Example: -f '^br0|.*-v1$'", 0 },
+    { "disable_ipv6ll_filter", 'l', NULL, 0,
+      "Disable the default IPv6 link-local filter", 0},
     { "no-qfilter-present", 'q', NULL, 0, "Do not replace the present Qdisc"
       "filter if it is present on the Ingress device", 0 },
     { "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
     { "xdp", 'x', NULL, 0, "Attach XDP instead of TC. This option only works"
       "on devices with a VLAN header on the packets available to XDP.", 0},
-    { "disable_ipv6ll_filter", 'l', NULL, 0,
-      "Disable the default IPv6 link-local filter", 0},
     { NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
     {},
 };
 
-static int add_neigh(struct lookup_cache *cache)
-{
-    int err = -1; // the default return value is an error
+static bool filter_deny_interfaces(char *ifname);
 
-    char buf[MNL_SOCKET_BUFFER_SIZE];
-    struct nlmsghdr *nlh;
-    struct ndmsg *ndm;
-    struct in6_addr *addr = &cache->neighbor_reply->ip;
-    int ret;
-
-    nlh = mnl_nlmsg_put_header(buf);
-    nlh->nlmsg_type = RTM_NEWNEIGH;
-    if (cache->neighbor_reply->in_family == AF_INET6)
-        nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
-    else
-        nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_ACK | NLM_F_EXCL;
-    nlh->nlmsg_seq = ++nlm_seq;
-
-    ndm = mnl_nlmsg_put_extra_header(nlh, sizeof(*ndm));
-    ndm->ndm_family = cache->neighbor_reply->in_family;
-    ndm->ndm_state = NUD_REACHABLE;
-    ndm->ndm_ifindex = cache->ifindex;
-
-    // Add IP address
-    if (IN6_IS_ADDR_V4MAPPED(addr)) {
-        struct in_addr ipv4_addr;
-        memcpy(&ipv4_addr, &addr->s6_addr[12], sizeof(ipv4_addr));
-        mnl_attr_put(nlh, NDA_DST, sizeof(ipv4_addr), &ipv4_addr);
-    } else {
-        mnl_attr_put(nlh, NDA_DST, sizeof(*addr), addr);
-    }
-
-    // Add MAC address
-    mnl_attr_put(nlh, NDA_LLADDR, sizeof(cache->neighbor_reply->mac),
-                 cache->neighbor_reply->mac);
-
-    // Add VLAN information if needed
-    if (cache->neighbor_reply->vlan_id > 0)
-        mnl_attr_put(nlh, NDA_VLAN, sizeof(cache->neighbor_reply->vlan_id),
-                     &cache->neighbor_reply->vlan_id);
-
-    pr_debug("Requesting to add neighbor:\n");
-    pr_debug("- Interface %d: %s\n", cache->ifindex, cache->ifname);
-    pr_debug("- IP address: %s\n", cache->ip_str);
-    pr_debug("- MAC address: %s\n", cache->mac_str);
-
-    pr_nl("Sending netlink message\n");
-    pr_nl_nlmsg(nlh, nlm_seq);
-
-    // Send Netlink request update neigh table
-    if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-        pr_err(errno, "mnl_socket_sendto");
-        goto out;
-    }
-
-    // Parse the response
-    ret = mnl_socket_recvfrom(nl, buf, sizeof(buf));
-    if (ret < 0) {
-        pr_err(errno, "mnl_socket_recvfrom");
-        goto out;
-    }
-
-    pr_nl("Received netlink message\n");
-    pr_nl_nlmsg((struct nlmsghdr *)buf, nlm_seq);
-
-    err = mnl_cb_run(buf, ret, nlm_seq, mnl_portid,
-                     NULL, NULL);
-    if (err < MNL_CB_STOP) {
-        if (errno == EEXIST) {
-            pr_debug("Neighbor already exists in the cache\n");
-            goto out;
-        }
-        pr_err(errno, "Failed to parse Netlink message");
-        goto out;
-    }
-
-    err = 0; // Success
-    pr_info("Added MAC: %s IP: %s/%d to FDB on interface: %s\n",
-            cache->mac_str, cache->ip_str, cache->cidr, cache->ifname);
-
-out:
-    return err;
-}
-
-static bool filter_interfaces(char *ifname)
-{
-    int ret;
-    if (!env.has_filter)
-        return false;
-
-    ret = regexec(&env.regex_filter, ifname, 0, NULL, 0);
-    if (ret)
-        return false;
-
-    pr_debug("Filtered interface %s using filter: '%s'\n", ifname,
-             env.regexp_filter_ifname);
-    return true;
-}
-
-static int netlink_recv(struct nlmsghdr *nlh, char *buf, size_t buf_size,
-                        mnl_cb_t parse_nlm_func,
-                        struct lookup_cache *cache)
-{
-    int ret;
-
-    pr_nl("sending netlink message\n");
-    pr_nl_nlmsg(nlh, nlm_seq);
-
-    // Send Netlink request to fetch FDB entries
-    if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-        pr_err(errno, "mnl_socket_sendto");
-        return false;
-    }
-
-    // Parse the response
-    while ((ret = mnl_socket_recvfrom(nl, buf, buf_size)) > 0) {
-        pr_nl("received netlink message\n");
-        pr_nl_nlmsg((struct nlmsghdr *)buf, nlm_seq);
-
-
-        ret = mnl_cb_run(buf, ret, nlm_seq, mnl_portid, parse_nlm_func,
-                         cache);
-
-        if (nlh->nlmsg_type == NLMSG_DONE)
-            break;
-
-        if (nlh->nlmsg_type == NLMSG_ERROR) {
-            struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nlh);
-            if (err->error != 0)
-                pr_err(err->error, "Netlink error");
-
-            break;
-        }
-
-        if (ret < MNL_CB_STOP) {
-            pr_err(errno, "Failed to parse Netlink message");
-            break;
-        }
-    }
-
-    return ret;
-}
-
-static int parse_nlm(const struct nlmsghdr *nlh, size_t nlm_len,
-                     mnl_attr_cb_t parse_nlm_attr_func,
-                     const struct nlattr **tb, void *data)
-{
-    mnl_attr_parse(nlh, nlm_len, parse_nlm_attr_func, tb);
-
-    if (nlh->nlmsg_type == NLMSG_ERROR) {
-        struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(nlh);
-        if (err->error != 0)
-            pr_err(err->error, "Netlink error");
-        return MNL_CB_STOP;
-    }
-
-    if (nlh->nlmsg_type == NLMSG_DONE)
-        return MNL_CB_STOP;
-
-    return MNL_CB_OK;
-}
-
-// Extract information about an ifindex using Netlink
-static int getlink_parse_attr_cb(const struct nlattr *attr, void *data)
-{
-    const struct nlattr **tb = data;
-    int type = mnl_attr_get_type(attr);
-
-    /* skip unsupported attribute in user-space */
-    if (mnl_attr_type_valid(attr, IFLA_MAX) < 0)
-        return MNL_CB_OK;
-
-    switch(type) {
-        case IFLA_LINK:
-            if (mnl_attr_validate(attr, MNL_TYPE_U32) < 0) {
-                pr_err(errno, "mnl_attr_validate");
-                return MNL_CB_ERROR;
-            }
-            break;
-        case IFLA_LINKINFO:
-            if (mnl_attr_validate(attr, MNL_TYPE_NESTED) < 0) {
-                pr_err(errno, "mnl_attr_validate");
-                return MNL_CB_ERROR;
-            }
-    }
-    tb[type] = attr;
-    return MNL_CB_OK;
-}
-
-static int getlink_parse_nlm_cb(const struct nlmsghdr *nlh, void *data)
-{
-    struct ifinfomsg *ifm = mnl_nlmsg_get_payload(nlh);
-    struct lookup_cache *cache = data;
-    struct nlattr *tb[IFLA_MAX + 1] = {};
-
-    if (nlh->nlmsg_type != RTM_NEWLINK) {
-        pr_err(0, "Unexpected Netlink message type %d, expected %d",
-               nlh->nlmsg_type, RTM_NEWLINK);
-        return MNL_CB_STOP;
-    }
-
-    int ret = parse_nlm(nlh, sizeof(*ifm), getlink_parse_attr_cb,
-                  (const struct nlattr **) tb, tb);
-    if (ret < 0)
-        return ret;
-
-    // Add attributes to cache
-    if (tb[IFLA_LINK])
-        cache->link_ifindex = mnl_attr_get_u32(tb[IFLA_LINK]);
-
-    if (tb[IFLA_LINKINFO]) {
-        struct nlattr *link_attr;
-        mnl_attr_for_each_nested(link_attr, tb[IFLA_LINKINFO]) {
-            if (mnl_attr_get_type(link_attr) == IFLA_INFO_KIND) {
-
-                snprintf(cache->kind, sizeof(cache->kind), "%s",
-                         mnl_attr_get_str(link_attr));
-            }
-        }
-    }
-
-    if (strcmp(cache->kind, "macvlan") == 0)
-        cache->is_macvlan = true;
-
-    return MNL_CB_OK;
-}
-
-static bool probe_ifindex(struct lookup_cache *cache)
-{
-    char buf[MNL_SOCKET_BUFFER_SIZE];
-    struct nlmsghdr *nlh;
-    struct ifinfomsg *ifm;
-    int ret;
-
-    nlh = mnl_nlmsg_put_header(buf);
-    nlh->nlmsg_type = RTM_GETLINK;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-    nlh->nlmsg_seq = ++nlm_seq;
-
-    ifm = mnl_nlmsg_put_extra_header(nlh, sizeof(struct ifinfomsg));
-    ifm->ifi_family = AF_UNSPEC;
-    ifm->ifi_index = cache->ifindex;
-
-    ret = netlink_recv(nlh, buf, sizeof(buf), getlink_parse_nlm_cb, cache);
-
-    if (ret < 0) {
-        pr_err(errno, "Failed to lookup interface %s", cache->ifname);
-        return false;
-    }
-
-    pr_debug("Device %d is of type: %s\n", cache->ifindex, strlen(
-                 cache->kind) ? cache->kind : "unknown");
-    return true;
-}
-
-// Extract information from the FDB using Netlink
-static int getneigh_parse_attr_cb(const struct nlattr *attr, void *data)
-{
-    const struct nlattr **tb = data;
-    int type = mnl_attr_get_type(attr);
-
-    /* skip unsupported attribute in user-space */
-    if (mnl_attr_type_valid(attr, NDA_MAX) < 0)
-        return MNL_CB_OK;
-
-    switch(type) {
-    case NDA_DST:
-    case NDA_LLADDR:
-        if (mnl_attr_validate(attr, MNL_TYPE_BINARY) < 0) {
-            pr_err(errno, "mnl_attr_validate");
-            return MNL_CB_ERROR;
-        }
-        break;
-    }
-    tb[type] = attr;
-    return MNL_CB_OK;
-}
-
-static int getneigh_parse_nlm_cb(const struct nlmsghdr *nlh, void *data)
-{
-    struct lookup_cache *cache = data;
-    struct ndmsg *ndm = mnl_nlmsg_get_payload(nlh);
-    struct nlattr *tb[NDA_MAX + 1] = {};
-    const __u8 *fdb_mac = NULL;
-
-    if (nlh->nlmsg_type != RTM_NEWNEIGH) {
-        pr_err(0, "Unexpected Netlink message type %d, expected %d",
-               nlh->nlmsg_type, RTM_NEWNEIGH);
-        return MNL_CB_STOP;
-    }
-
-    if (parse_nlm(nlh, sizeof(*ndm), getneigh_parse_attr_cb,
-                  (const struct nlattr **) tb, cache) < 0)
-        return MNL_CB_STOP;
-
-    if (tb[NDA_LLADDR] == NULL)
-        return MNL_CB_OK;
-
-    fdb_mac = mnl_attr_get_payload(tb[NDA_LLADDR]);
-    if (memcmp(fdb_mac, cache->neighbor_reply->mac,
-               sizeof(cache->neighbor_reply->mac)) != 0)
-        return MNL_CB_OK;
-
-    // Add attributes to cache
-    if (ndm->ndm_flags & NTF_EXT_LEARNED)
-        cache->is_ext_learned = true;
-
-    return MNL_CB_OK;
-}
-
-static bool probe_fdb(struct lookup_cache *cache)
-{
-    // Query the FDB entries in AF_BRIDGE for the specified MAC address
-    char buf[MNL_SOCKET_BUFFER_SIZE];
-    struct nlmsghdr *nlh;
-    struct ndmsg *ndm;
-    int ret;
-
-    nlh = mnl_nlmsg_put_header(buf);
-    nlh->nlmsg_type = RTM_GETNEIGH;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP;
-    nlh->nlmsg_seq = ++nlm_seq;
-
-    ndm = mnl_nlmsg_put_extra_header(nlh, sizeof(*ndm));
-    ndm->ndm_family = AF_BRIDGE;
-
-    ret = netlink_recv(nlh, buf, sizeof(buf), getneigh_parse_nlm_cb, cache);
-
-    if (ret < 0) {
-        pr_err(errno, "Failed lookup FDB");
-        return false;
-    }
-
-    return true;
-}
-
-static bool find_ifindex_from_ip(struct lookup_cache *cache)
-{
-    struct ifaddrs *ifaddr, *ifa;
-    struct sockaddr_in6 *addr6, *netmask6;
-    struct sockaddr_in *addr4, *netmask4;
-    struct in6_addr addr, netmask;
-    struct in6_addr *given_ip = &cache->neighbor_reply->ip;
-    struct in6_addr given_ip_network, network;
-    const char* matching_ifname = NULL;
-    __u32 matching_ifindex;
-
-    if (getifaddrs(&ifaddr) == -1)
-        goto err1;
-
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        struct lookup_cache getlink_cache = *cache;
-        if (ifa->ifa_addr == NULL || ifa->ifa_netmask == NULL)
-            continue;
-
-        // Map legacy IPv4 addresses to IPv6
-        if (ifa->ifa_addr->sa_family == AF_INET) {
-            // Handle IPv4 to IPv6 mapping
-            addr4 = (struct sockaddr_in *)ifa->ifa_addr;
-            netmask4 = (struct sockaddr_in *)ifa->ifa_netmask;
-            map_ipv4_to_ipv6(&addr, addr4->sin_addr.s_addr);
-            map_ipv4_to_ipv6(&netmask, netmask4->sin_addr.s_addr);
-        } else if (ifa->ifa_addr->sa_family == AF_INET6) {
-            // Handle IPv6 addresses
-            addr6 = (struct sockaddr_in6 *)ifa->ifa_addr;
-            netmask6 = (struct sockaddr_in6 *)ifa->ifa_netmask;
-            addr = addr6->sin6_addr;
-            netmask = netmask6->sin6_addr;
-        } else { // Ignore unknown address families
-            continue;
-        }
-
-        // Calculate the network address
-        calculate_network_address(&addr, &netmask, &network);
-        calculate_network_address(given_ip, &netmask, &given_ip_network);
-
-        // Compare the network addresses
-        if (!compare_ipv6_addresses(&network, &given_ip_network))
-            continue;
-
-        getlink_cache.ifindex = if_nametoindex(ifa->ifa_name);
-        if (!getlink_cache.ifindex) {
-            pr_err(errno, "if_nametoindex");
-            continue;
-        }
-
-        probe_ifindex(&getlink_cache);
-
-        if (getlink_cache.link_ifindex == 0)
-            continue;
-
-        if (getlink_cache.link_ifindex != env.ifidx_mon) {
-            pr_debug("Skipping interface %d because it isn't directly"
-                     "connected to %d\n", getlink_cache.link_ifindex,
-                     env.ifidx_mon);
-            continue;
-        }
-
-        matching_ifname = ifa->ifa_name;
-        *cache = getlink_cache;
-        break; // Found a matching interface
-    }
-
-    if (!matching_ifname) {
-        pr_debug("No interface found for IP: %s\n", cache->ip_str);
-        goto err2;
-    }
-
-    matching_ifindex = if_nametoindex(matching_ifname);
-    if (!matching_ifindex) {
-        pr_err(errno, "if_nametoindex");
-        goto err2;
-    }
-
-    memcpy(cache->ifname, matching_ifname, sizeof(cache->ifname));
-    cache->ifindex = matching_ifindex;
-
-    cache->cidr = calculate_cidr(&netmask);
-
-    if (env.debug) {
-        if (format_ip_address(cache->debug.network_str,
-                              sizeof(cache->debug.network_str), &network)) {
-            pr_err(errno, "format_ip_address");
-            goto err2;
-        }
-        pr_debug("Found IP: %s in %s/%d on %s linked to %s\n",
-                 cache->ip_str,
-                 cache->debug.network_str,
-                 cache->cidr,
-                 cache->ifname,
-                 env.ifidx_mon_str);
-    }
-    return true;
-err2:
-    freeifaddrs(ifaddr);
-err1:
-    return false;
-}
-
-// Callback function to handle data from the ring buffer
+// Callback function to handle data from the BPF ring buffer
 static int handle_neighbor_reply(void *ctx, void *data, size_t data_sz)
 {
-    struct lookup_cache cache = {0};
-    cache.neighbor_reply = (struct neighbor_reply *)data;
+    struct neighbor_reply *neighbor_reply = (struct neighbor_reply *)data;
+    struct link_network_cache *link_net;
+    struct link_cache *link;
+    struct fdb_cache *fdb;
+    __u8 mac_str[MAC_ADDR_STR_LEN];
+    char ip_str[INET6_ADDRSTRLEN];
 
-    if (env.only_ipv6 && cache.neighbor_reply->in_family != AF_INET6)
+    if (!neighbor_reply) {
+        pr_err(0, "Neighbor Reply: Invalid data");
         return 1;
-    else if (env.only_ipv4 && cache.neighbor_reply->in_family != AF_INET)
+    }
+
+    if (env.only_ipv6 && neighbor_reply->in_family != AF_INET6)
+        return 1;
+    else if (env.only_ipv4 && neighbor_reply->in_family != AF_INET)
         return 1;
 
     env.count--;
 
-    pr_debug("Received Neighbor Reply\n");
-
-    mac_to_string(cache.mac_str, cache.neighbor_reply->mac,
-                  sizeof(cache.mac_str));
-
-    if (format_ip_address(cache.ip_str, sizeof(cache.ip_str),
-                          &cache.neighbor_reply->ip)) {
-        pr_err(errno, "format_ip_address");
+    link_net = cache_get_link_network_by_reply(neighbor_reply);
+    if (!link_net) {
+        pr_err(0, "NIC with VLAN ID: %d Network: %d not found in cache",
+               neighbor_reply->vlan_id, neighbor_reply->network_id);
         return 1;
     }
+    link = link_net->link;
 
-    pr_debug("Received Neighbor Reply MAC: %s - IP: %s\n", cache.mac_str,
-             cache.ip_str);
+    fdb = cache_get_fdb_by_reply(neighbor_reply, link->ifindex);
+    if (fdb) {
+        pr_debug("Neighbor Reply: IP: %s MAC: %s nic: %s is externally learned. Skipping\n",
+                 fdb->mac_str, link_net->network->network_str, fdb->link->ifname);
+        return 0;
+    }
 
-    if (!env.disable_ipv6ll_filter &
-        (cache.neighbor_reply->in_family == AF_INET6)) {
-        if (IN6_IS_ADDR_LINKLOCAL(&cache.neighbor_reply->ip)) {
-            pr_debug("Neighbor IP '%s' is IPv6 link-local: filtered\n", cache.ip_str);
-            return 1;
+    mac_to_string(mac_str, neighbor_reply->mac, sizeof(mac_str));
+    format_ip_address(ip_str, sizeof(ip_str), &neighbor_reply->ip);
+    pr_debug("Neighbor Reply: IP: %s MAC: %s nic: %s\n",
+            ip_str, mac_str, link->ifname);
+
+    // Make the neighbor entry reachable in the Linux kernel's neighbor table
+    // This will also prompt a Netlink reply from the kernel that we will use to
+    // update our local cache
+    netlink_send_neigh(neighbor_reply, link->ifindex);
+
+    return 0;
+}
+
+static int handle_neigh_add(struct netlink_neigh_cmd *cmd)
+{
+    struct link_cache *link;
+    struct link_network_cache *link_net;
+    struct neigh_cache *neigh;
+
+    char ip_str[INET6_ADDRSTRLEN];
+    __u8 mac_str[MAC_ADDR_STR_LEN];
+
+    // Ignore neigh events until we are initialized
+    if (!(env.has_links && env.has_networks && env.has_fdb))
+        goto out;
+
+    if (env.debug) {
+        format_ip_address(ip_str, sizeof(ip_str), &cmd->ip);
+        mac_to_string(mac_str, cmd->mac, sizeof(mac_str));
+    }
+
+    // Skip entries without an interface
+    if (cmd->ifindex == 0) {
+        pr_debug("Neigh: IP: %s MAC: %s has no interface\n",
+                 ip_str, mac_str);
+        goto out;
+    }
+
+    // Skip incomplete entries
+    if (is_zero_mac(cmd->mac))
+        goto out;
+
+    // We skip externally learned entries
+    if (cmd->is_externally_learned) {
+        pr_debug("Neigh: IP: %s MAC: %s is externally learned\n",
+                 ip_str, mac_str);
+        goto out;
+    }
+
+    // Check if the link is a connected SVI
+    link = cache_get_link(cmd->ifindex);
+    if (!link) {
+        pr_err(0, "Failed to lookup interface %d", cmd->ifindex);
+        goto out;
+    }
+
+    // Ignoring IPs that are not part of a target network
+    link_net = cache_get_link_network_by_addr(link, &cmd->ip);
+    if (!link_net)
+        goto out;
+
+    neigh = cache_get_neigh(cmd);
+    if (neigh) { // Already cached
+        if (neigh->nud_state != cmd->nud_state)
+            cache_neigh_update(cmd);
+    } else { // Create a new cache entry
+        neigh = cache_add_neigh(link_net, cmd);
+        if (!neigh) {
+            pr_err(0, "Failed to add Neigh: IP: %s MAC: %s to cache\n",
+                   ip_str, mac_str);
+            goto out;
+        }
+        pr_info("Neigh: IP: %s MAC: %s nic: %s added to cache\n",
+                neigh->ip_str, neigh->mac_str,
+                link->ifname);
+    }
+
+out:
+    return 0;
+}
+
+static int handle_neigh_del(struct netlink_neigh_cmd *cmd)
+{
+    struct neigh_cache *neigh = cache_get_neigh(cmd);
+
+    if (!neigh) // Not cached
+        goto out;
+
+    cache_del_neigh(neigh);
+
+out:
+    return 0;
+}
+
+static int handle_fdb_add(struct netlink_neigh_cmd *cmd)
+{
+    int ret = 0;
+    struct link_cache *link;
+    struct fdb_cache *fdb;
+    __u8 mac_str[MAC_ADDR_STR_LEN];
+
+    // Ignore neigh events until we are initialized
+    if (!(env.has_links && env.has_networks))
+        goto out;
+
+    // Skip entries without an interface
+    if (cmd->ifindex == 0)
+        goto out;
+
+    link = cache_get_link(cmd->ifindex);
+    if (!link) {
+        pr_err(0, "Failed to lookup interface %d", cmd->ifindex);
+        goto out;
+    }
+
+    if (cmd->is_externally_learned) {
+        mac_to_string(mac_str, cmd->mac, sizeof(mac_str));
+        pr_debug("FDB: MAC: %s is externally learned: Not cached\n", mac_str);
+        goto out;
+    }
+
+    fdb = cache_get_fdb(cmd);
+    if (fdb) // Already cached
+        goto out;
+
+    fdb = cache_add_fdb(cmd);
+    if (!fdb) {
+        mac_to_string(mac_str, cmd->mac, sizeof(mac_str));
+        pr_err(0, "Failed to add FDB: MAC: %s to cache\n", mac_str);
+        ret = -1;
+        goto out;
+    }
+
+out:
+    return ret;
+}
+
+static int handle_fdb_del(struct netlink_neigh_cmd *cmd)
+{
+    struct fdb_cache *fdb = cache_get_fdb(cmd);
+
+    if (!fdb) // Not cached
+        goto out;
+
+    cache_del_fdb(cmd);
+
+out:
+    return 0;
+}
+
+static int handle_addr_add(struct netlink_addr_cmd *cmd)
+{
+    int ret = 0;
+    struct network_cache *network;
+    struct link_cache *link;
+    struct link_network_cache *link_net;
+    char network_cidr_str[INET6_ADDRSTRLEN + 4]; // IPv6 address + / + prefixlen
+
+    // Ignore neigh events until we are initialized
+    if (!env.has_links)
+        goto out;
+
+    if (!env.disable_ipv6ll_filter) {
+        if (IN6_IS_ADDR_LINKLOCAL(&cmd->ip))
+            goto out;
+    }
+
+    link = cache_get_link(cmd->ifindex);
+    if (!link) {
+        pr_debug("Failed to lookup interface %d\n", cmd->ifindex);
+        goto out;
+    }
+
+    if (!link->is_svi) {
+        pr_debug("Link: %s is not an SVI connected to the bridge\n",
+                 link->ifname);
+        goto out;
+    }
+
+    format_ip_address_cidr(network_cidr_str, sizeof(network_cidr_str),
+                        &cmd->ip, cmd->prefixlen);
+
+    network = cache_get_network(cmd);
+    if (!network) {
+        network = cache_add_network(cmd);
+        if (!network) {
+            pr_err(0, "Failed to add network %s to cache", network_cidr_str);
+            ret = -1;
+            goto out;
         }
     }
 
-    if (!find_ifindex_from_ip(&cache)) {
-        pr_debug("No interface mached destination: filtered\n");
-        return 1;
+    link_net = cache_get_link_network(link->ifindex, network->network);
+    if (!link_net) {
+        link_net = cache_new_link_network();
+        if (!link_net) {
+            pr_err(0, "Failed to add link %s to network %s",
+                   link->ifname, network_cidr_str);
+            ret = -1;
+            goto out;
+        }
+
+        link_net->link = link;
+        link_net->network = network;
+        link_net->ip = calculate_network_using_cidr(&network->network,
+                                                    cmd->prefixlen);
+
+        ret = cache_add_link_network(link_net);
+        if (ret)
+            goto out;
+
+        pr_info("Cache: Added: Network(%d): %s with link %s\n",
+                network->id, network_cidr_str, link->ifname);
     }
 
-    if (filter_interfaces(cache.ifname)) {
-        pr_debug("Interface '%s' matches regexp filter: filtered\n",
-                 cache.ifname);
-        return 1;
+out:
+    return ret;
+}
+
+static int handle_addr_del(struct netlink_addr_cmd *cmd)
+{
+    int ret = -1;
+    struct network_cache *network = cache_get_network(cmd);
+
+    if (!network) {
+        pr_debug("Network: %s/%d not cached: Can't remove\n",
+                 network->network_str, network->prefixlen);
+        goto out;
     }
 
-    if (cache.is_macvlan && !env.disable_macvlan_filter) {
-        pr_debug("Interface '%s' is a macvlan: filtered\n", cache.ifname);
-        return 1;
+    cache_del_network(cmd);
+
+    pr_info("Cache: Removing Network: %s/%d\n", network->network_str,
+            network->prefixlen);
+
+    ret = 0;
+
+out:
+    return ret;
+}
+
+static int handle_link_add(struct netlink_link_cmd *cmd)
+{
+    int ret = 0;
+    struct link_cache *link;
+
+    link = cache_get_link(cmd->ifindex);
+    if (link) {
+        pr_debug("Link: %d: %s already cached\n",
+                 cmd->ifindex, cmd->ifname);
+        cache_update_link(link, cmd);
+        goto out;
+    } else {
+        link = cache_add_link(cmd);
+        if (!link) {
+            pr_err(errno, "Failed to add link %d: %s to cache",
+                   cmd->ifindex, cmd->ifname);
+            ret = -1;
+            goto out;
+        }
     }
 
-    probe_fdb(&cache);
-    if (cache.is_ext_learned) {
-        pr_debug("MAC address is not connected locally: filtered\n");
-        return 1;
+    link->is_svi = cmd->link_ifindex == env.ifidx_mon ? true : false;
+
+    if (filter_deny_interfaces(cmd->ifname)) {
+        pr_debug("Link: %d: %s matches regexp filter: filtered\n",
+                 cmd->ifindex, cmd->ifname);
+        link->ignore_link = true;
     }
 
-    pr_debug("MAC is locally connected. Adding neighbor.\n");
-    if (add_neigh(&cache))
-        return 1;
+    if (link->is_svi)
+        pr_info("Cache: Added: NIC: %s with vlan: %d\n",
+            cmd->ifname, cmd->vlan_id);
+    else
+        pr_debug("Cache: Added: NIC: %s with vlan: %d\n",
+            cmd->ifname, cmd->vlan_id);
 
-    // Success
+out:
+    return ret;
+}
+
+static int handle_link_del(struct netlink_link_cmd *cmd)
+{
+    int ret = 0;
+    struct link_cache *link = cache_get_link(cmd->ifindex);
+
+    if (!link) {
+        pr_debug("Cache: Link: %s not cached: Can't remove\n", cmd->ifname);
+        ret = -1;
+        goto out;
+    }
+
+    cache_del_link(cmd);
+
+    pr_info("Cache: Link: Removed: %s\n", cmd->ifname);
+
+out:
+    return ret;
+}
+
+static int handle_netlink_cmd(union netlink_cmd *cmd)
+{
+    int ret = 0;
+    switch (cmd->cmd_type) {
+        case CMD_NEIGH_ADD:
+            ret = handle_neigh_add(&cmd->neigh);
+            break;
+        case CMD_NEIGH_DEL:
+            ret = handle_neigh_del(&cmd->neigh);
+            break;
+        case CMD_FDB_ADD:
+            ret = handle_fdb_add(&cmd->neigh);
+            break;
+        case CMD_FDB_DEL:
+            ret = handle_fdb_del(&cmd->neigh);
+            break;
+        case CMD_ADDR_ADD:
+            ret = handle_addr_add(&cmd->addr);
+            break;
+        case CMD_ADDR_DEL:
+            ret = handle_addr_del(&cmd->addr);
+            break;
+        case CMD_LINK_ADD:
+            ret = handle_link_add(&cmd->link);
+            break;
+        case CMD_LINK_DEL:
+            ret = handle_link_del(&cmd->link);
+            break;
+        default:
+            pr_err(0, "Unknown command\n");
+            break;
+    }
+
+    netlink_cmd_free(cmd);
+
+    return ret;
+}
+
+static int handle_netlink(void)
+{
+    union netlink_cmd *cmd;
+
+    // Process all Netlink messages and prep the cmd queue
+    netlink_process_rx_queue();
+
+    while ((cmd = netlink_dequeue_cmd()))
+        if (handle_netlink_cmd(cmd))
+            return -1;
+
     return 0;
 }
 
@@ -620,14 +508,6 @@ out:
     return err;
 }
 
-static int handle_netlink(void)
-{
-    // TODO: Move all Netlink logic to this function
-    // This function will be responsible for monitoring all Netlink messages
-    // and update the eBPF code accordingly.
-    return 0;
-}
-
 static int handle_ring_buffer(void)
 {
     int err;
@@ -646,9 +526,24 @@ out:
 static void main_loop(void)
 {
     struct epoll_event events[env.number_of_fds];
+    bool last_round = false;
+
+    if (netlink_queue_send_next()) {
+        pr_err(errno, "Failed to send Netlink message");
+        return; // Failure
+    }
 
     while (true) {
-        int n = epoll_wait(env.epoll_fd, events, env.number_of_fds, -1);
+        int n;
+
+        if (env.has_count) {
+            if (last_round)
+                break;
+            if (env.count <= 0)
+                last_round = true;
+        }
+
+        n = epoll_wait(env.epoll_fd, events, env.number_of_fds, -1);
         if (n == -1) {
             if (errno == EINTR)
                 continue; // Ignore interrupted by signal
@@ -661,6 +556,7 @@ static void main_loop(void)
          * 1. Signal events
          * 2. Netlink events
          * 3. BPF ring buffer events
+         * 4. Send Netlink messages from the tx queue
          */
 
         // Signal events
@@ -682,11 +578,32 @@ static void main_loop(void)
         // BPF ring buffer events
         for (int i = 0; i < n; ++i) {
             if (events[i].data.fd == env.ringbuf_fd) {
-                if (handle_ring_buffer())
+                if (handle_ring_buffer()) {
+                    pr_err(errno, "Failed to consume ring buffer");
                     return; // Failure
+                }
             }
         }
+
+        // Send Netlink messages from the tx queue
+        if (netlink_queue_send_next()) {
+            pr_err(errno, "Failed to send Netlink message");
+            return; // Failure
+        }
     }
+}
+
+static bool filter_deny_interfaces(char *ifname)
+{
+    int ret;
+    if (!env.has_deny_filter)
+        return false;
+
+    ret = regexec(&env.deny_filter, ifname, 0, NULL, 0);
+    if (ret)
+        return false;
+
+    return true;
 }
 
 // Signal setup and cleanup
@@ -725,52 +642,9 @@ static void cleanup_signals(void)
         close(env.signal_fd);
 }
 
-// Netlink setup and cleanup
-static int setup_netlink(void)
-{
-    int err = 0;
-
-    nlm_seq = time(NULL);
-    if (err) {
-        fprintf(stderr, "Could not compile regex");
-        goto out;
-    }
-
-    nl = mnl_socket_open(NETLINK_ROUTE);
-    if (nl == NULL) {
-        err = errno;
-        perror("mnl_socket_open");
-        goto out;
-    }
-    mnl_portid = mnl_socket_get_portid(nl);
-    pr_nl("MNL port ID: %d\n", mnl_portid);
-
-    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-        err = -errno;
-        perror("mnl_socket_bind");
-        goto out;
-    }
-
-    env.nl_fd = mnl_socket_get_fd(nl);
-    if (env.nl_fd < 0) {
-        err = env.nl_fd;
-        perror("mnl_socket_get_fd");
-        goto out;
-    }
-    env.number_of_fds++;
-
-out:
-    return err;
-}
-
-static void cleanup_netlink(void)
-{
-    if (nl)
-        mnl_socket_close(nl);
-}
-
 // BPF setup and cleanup
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
+                           va_list args)
 {
     if (level == LIBBPF_DEBUG && !env.debug)
         return 0;
@@ -792,12 +666,16 @@ static int setup_bpf(void)
         goto out;
     }
 
+    // Load the BPF program
     err = neighsnoopd_bpf__load(env.skel);
     if (err) {
         perror("Failed to load BPF skeleton\n");
         err = errno;
         goto out;
     }
+
+    env.target_networks_fd = bpf_map__fd(
+        bpf_object__find_map_by_name(env.skel->obj, "target_networks"));
 
     // XDP
     struct bpf_link *xdp_link;
@@ -897,7 +775,7 @@ static void cleanup_bpf(void)
 // epoll setup and cleanup
 static int setup_epoll(void)
 {
-    int err;
+    int err = 0;
     struct epoll_event event;
 
     env.epoll_fd = epoll_create1(0);
@@ -939,6 +817,43 @@ static void cleanup_epoll(void)
         close(env.epoll_fd);
 }
 
+static int setup_filters(void)
+{
+    int ret = 0;
+    if (env.has_deny_filter) {
+        ret = regcomp(&env.deny_filter, env.str_deny_filter, REG_EXTENDED);
+        if (ret) {
+            perror("Failed to compile regular expression");
+            goto out;
+        }
+    }
+
+out:
+    return ret;
+}
+
+static void cleanup_filters(void)
+{
+    if (env.has_deny_filter)
+        regfree(&env.deny_filter);
+}
+
+static int setup_packet(void)
+{
+    env.packet_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (env.packet_fd == -1) {
+        perror("Failed to open packet socket");
+        return errno;
+    }
+    return 0;
+}
+
+static void cleanup_packet(void)
+{
+    if (env.packet_fd >= 0)
+        close(env.packet_fd);
+}
+
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
     static int pos_args;
@@ -978,11 +893,11 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
                 argp_usage(state);
                 exit(EXIT_FAILURE);
             }
-            env.regexp_filter_ifname = arg;
-            env.has_filter = true;
+            env.str_deny_filter = arg;
+            env.has_deny_filter = true;
             break;
-        case 'm':
-            env.disable_macvlan_filter = true;
+        case 'l':
+            env.disable_ipv6ll_filter = true;
             break;
         case 'q':
             env.fail_on_qfilter_present = true;
@@ -1046,47 +961,55 @@ int main(int argc, char **argv)
     err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
     if (err) {
         err = EXIT_FAILURE;
-        goto cleanup1;
+        goto cleanup0;
     }
 
-    if (env.has_filter) {
-        err = regcomp(&env.regex_filter, env.regexp_filter_ifname, REG_EXTENDED);
-        if (err) {
-            perror("Failed to compile regular expression");
-            err = EXIT_FAILURE;
-            goto cleanup1;
-        }
+    if (setup_filters()) {
+        err = EXIT_FAILURE;
+        goto cleanup0;
     }
-
-    if (setup_signals()) {
+    if (setup_packet()) {
         err = EXIT_FAILURE;
         goto cleanup1;
     }
-    if (setup_netlink()) {
+    if (setup_cache()) {
         err = EXIT_FAILURE;
         goto cleanup2;
     }
-    if (setup_bpf()) {
+    if (setup_signals()) {
         err = EXIT_FAILURE;
         goto cleanup3;
     }
-    if (setup_epoll()) {
+    if (setup_netlink()) {
         err = EXIT_FAILURE;
         goto cleanup4;
+    }
+    if (setup_bpf()) {
+        err = EXIT_FAILURE;
+        goto cleanup5;
+    }
+    if (setup_epoll()) {
+        err = EXIT_FAILURE;
+        goto cleanup6;
     }
 
     // Main loop
     main_loop();
 
     // Cleanup
-cleanup4:
     cleanup_epoll();
-cleanup3:
+cleanup6:
     cleanup_bpf();
-cleanup2:
+cleanup5:
     cleanup_netlink();
-cleanup1:
+cleanup4:
     cleanup_signals();
-
+cleanup3:
+    cleanup_cache();
+cleanup2:
+    cleanup_packet();
+cleanup1:
+    cleanup_filters();
+cleanup0:
     return err;
 }

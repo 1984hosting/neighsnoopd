@@ -28,6 +28,14 @@ struct nd_opt_hdr {
 };
 
 struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, struct network_entry);
+    __type(value, struct network_value);
+    __uint(max_entries, 4096);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} target_networks SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);  // 16 MB
 } neighbor_ringbuf SEC(".maps");
@@ -57,15 +65,18 @@ static __always_inline int find_nd_opt(struct hdr_cursor *nh,
     return -1;
 }
 
-static __always_inline struct neighbor_reply *handle_nd_reply(
-    struct hdr_cursor *nh, void *data_end, struct ethhdr *eth)
+static __always_inline int handle_nd_reply(struct hdr_cursor *nh,
+                                           void *data_end, struct ethhdr *eth,
+                                           struct neighbor_reply *reply)
 {
-    struct neighbor_reply *neighbor_reply = NULL;
     struct ipv6hdr *ip;
     struct icmp6hdr *icmp6;
     struct in6_addr *target_ipv6;
+    struct network_entry key;
+    struct network_value *value;
     struct nd_opt_hdr *nd_opt_hdr;
     __u8 *target_mac;
+    int ret = -1;
 
     // Parse the IPv6 header
     if (parse_ip6hdr(nh, data_end, &ip) != IPPROTO_ICMPV6)
@@ -85,6 +96,14 @@ static __always_inline struct neighbor_reply *handle_nd_reply(
         goto out;
     nh->pos = target_ipv6 + 1;
 
+    // Check if the target IP address is in the list of target networks
+    key.prefixlen = 128;
+    __builtin_memcpy(&key.network, target_ipv6, sizeof(*target_ipv6));
+
+    value = bpf_map_lookup_elem(&target_networks, &key);
+    if (!value)
+        goto out;
+
     // Parse options to find the Source Link-Layer Address (MAC address)
     if (find_nd_opt(nh, data_end, ND_OPT_TARGET_LINKADDR)) {
         target_mac = eth->h_source;
@@ -101,27 +120,27 @@ static __always_inline struct neighbor_reply *handle_nd_reply(
     }
 
     // Add the data to the ringbuffer
-    neighbor_reply = bpf_ringbuf_reserve(&neighbor_ringbuf,
-                                         sizeof(*neighbor_reply), 0);
-    if (!neighbor_reply)
-        goto out;
+    __builtin_memcpy(reply->mac, target_mac, ETH_ALEN);
+    __builtin_memcpy(&reply->ip, target_ipv6, sizeof(*target_ipv6));
 
-    __builtin_memcpy(neighbor_reply->mac, target_mac, ETH_ALEN);
-    __builtin_memcpy(&neighbor_reply->ip, target_ipv6, sizeof(*target_ipv6));
+    reply->in_family = AF_INET6;
+    reply->network_id = value->network_id;
 
-    neighbor_reply->in_family = AF_INET6;
-
+    ret = 0;
 out:
-    return neighbor_reply;
+    return ret;
 }
 
-static __always_inline struct neighbor_reply *handle_arp_reply(
-    struct hdr_cursor *nh, void *data_end)
+static __always_inline int handle_arp_reply(struct hdr_cursor *nh, void *data_end,
+                            struct neighbor_reply *reply)
 {
-    struct neighbor_reply *neighbor_reply = NULL;
     struct arphdr *arp;
     __u8 *sender_ip;
     __u8 *sender_mac;
+    struct in6_addr target_ipv6;
+    struct network_entry key;
+    struct network_value *value;
+    int ret = -1;
 
     if (nh->pos + sizeof(struct arphdr) > data_end)
         goto out;
@@ -139,25 +158,32 @@ static __always_inline struct neighbor_reply *handle_arp_reply(
     if (sender_ip + 4 > (__u8 *)data_end)
         goto out;
 
-    // Add the data to the ringbuffer
-    neighbor_reply = bpf_ringbuf_reserve(&neighbor_ringbuf,
-                                         sizeof(*neighbor_reply), 0);
-    if (!neighbor_reply)
+    // Check if the target IP address is in the list of target networks
+    map_ipv4_to_ipv6(&target_ipv6, *(__be32 *)sender_ip);
+
+    key.prefixlen = 128;
+    __builtin_memcpy(&key.network, &target_ipv6, sizeof(target_ipv6));
+
+    value = bpf_map_lookup_elem(&target_networks, &key);
+    if (!value)
         goto out;
 
-    __builtin_memcpy(neighbor_reply->mac, sender_mac, ETH_ALEN);
-    map_ipv4_to_ipv6(&neighbor_reply->ip, *(__be32 *)sender_ip);
+    // Add the data to the ringbuffer
+    __builtin_memcpy(reply->mac, sender_mac, ETH_ALEN);
+    __builtin_memcpy(&reply->ip, &target_ipv6, sizeof(target_ipv6));
 
-    neighbor_reply->in_family = AF_INET;
+    reply->in_family = AF_INET;
+    reply->network_id = value->network_id;
 
+    ret = 0;
 out:
-    return neighbor_reply;
+    return ret;
 }
 
-static __always_inline struct neighbor_reply *handle_neighbor_reply(
-    void *data, void *data_end)
+static __always_inline int handle_neighbor_reply(
+    void *data, void *data_end, struct neighbor_reply *reply)
 {
-    struct neighbor_reply *neighbor_reply = NULL;
+    int ret = -1;
     struct collect_vlans vlans = { 0 };
     struct ethhdr *eth;
     int eth_type;
@@ -166,19 +192,16 @@ static __always_inline struct neighbor_reply *handle_neighbor_reply(
 
     eth_type = parse_ethhdr_vlan(&nh, data_end, &eth, &vlans);
     if (eth_type == bpf_htons(ETH_P_IPV6))
-        neighbor_reply = handle_nd_reply(&nh, data_end, eth);
+        ret = handle_nd_reply(&nh, data_end, eth, reply);
     else if (eth_type == bpf_htons(ETH_P_ARP))
-        neighbor_reply = handle_arp_reply(&nh, data_end);
+        ret = handle_arp_reply(&nh, data_end, reply);
     else
         goto out;
 
-    if (!neighbor_reply)
-        goto out;
-
-    neighbor_reply->vlan_id = vlans.id[0];
+    reply->vlan_id = vlans.id[0];
 
 out:
-    return neighbor_reply;
+    return ret;
 }
 
 SEC("xdp")
@@ -186,12 +209,20 @@ int handle_neighbor_reply_xdp(struct xdp_md *ctx)
 {
     void *data_end = (void *)(unsigned long long)ctx->data_end;
     void *data = (void *)(unsigned long long)ctx->data;
+    int ret;
 
-    struct neighbor_reply *neighbor_reply = handle_neighbor_reply(data,
-                                                                  data_end);
+    struct neighbor_reply *neighbor_reply = bpf_ringbuf_reserve(
+        &neighbor_ringbuf, sizeof(*neighbor_reply), 0);
 
     if (!neighbor_reply)
         goto out;
+
+    ret = handle_neighbor_reply(data, data_end, neighbor_reply);
+
+    if (ret) {
+        bpf_ringbuf_discard(neighbor_reply, 0);
+        goto out;
+    }
 
     neighbor_reply->ingress_ifindex = ctx->ingress_ifindex;
 
@@ -206,12 +237,20 @@ int handle_neighbor_reply_tc(struct __sk_buff *skb)
 {
     void *data_end = (void *)(unsigned long long)skb->data_end;
     void *data = (void *)(unsigned long long)skb->data;
+    int ret;
 
-    struct neighbor_reply *neighbor_reply = handle_neighbor_reply(data,
-                                                                  data_end);
+    struct neighbor_reply *neighbor_reply = bpf_ringbuf_reserve(
+        &neighbor_ringbuf, sizeof(*neighbor_reply), 0);
 
     if (!neighbor_reply)
         goto out;
+
+    ret = handle_neighbor_reply(data, data_end, neighbor_reply);
+
+    if (ret) {
+        bpf_ringbuf_discard(neighbor_reply, 0);
+        goto out;
+    }
 
     neighbor_reply->ingress_ifindex = skb->ifindex;
 
