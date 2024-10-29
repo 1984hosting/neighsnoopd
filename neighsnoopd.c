@@ -148,6 +148,177 @@ static int handle_neighbor_reply(void *ctx, void *data, size_t data_sz)
     return 0;
 }
 
+// Function to calculate the checksum for an IPv6 pseudo-header and payload
+static uint16_t checksum(const void *data, int len)
+{
+    uint32_t sum = 0;
+    const uint16_t *ptr = data;
+
+    while (len > 1) {
+        sum += *ptr++;
+        len -= 2;
+    }
+
+    if (len == 1) {
+        sum += *(uint8_t *)ptr;
+    }
+
+    // Fold 32-bit sum to 16 bits
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+
+    return (uint16_t)~sum;
+}
+
+static int send_neighbor_solicitation(struct neigh_cache *neigh)
+{
+    struct link_network_cache *src = neigh->sending_link_network;
+    unsigned char buffer[ETH_HLEN + sizeof(struct ipv6hdr)
+                         + sizeof(struct nd_neighbor_solicit) + 8];
+
+    // Zero out the buffer
+    memset(buffer, 0, sizeof(buffer));
+
+    // Ethernet header
+    struct ethhdr *eth = (struct ethhdr *)buffer;
+    memcpy(eth->h_dest, neigh->mac, ETH_ALEN);       // Target MAC address
+    memcpy(eth->h_source, src->link->mac, ETH_ALEN); // Source MAC address
+    eth->h_proto = htons(ETH_P_IPV6);                // IPv6 EtherType
+
+    // IPv6 header
+    struct ipv6hdr *ip6 = (struct ipv6hdr *)(buffer + ETH_HLEN);
+    ip6->version = 6;
+    ip6->priority = 0;
+    memset(ip6->flow_lbl, 0, sizeof(ip6->flow_lbl));
+    ip6->payload_len = htons(sizeof(struct nd_neighbor_solicit) + 8);
+    ip6->nexthdr = IPPROTO_ICMPV6;
+    ip6->hop_limit = 255; // Required for NS messages
+    memcpy(&ip6->saddr, &src->ip, sizeof(struct in6_addr));   // Source IPv6
+    memcpy(&ip6->daddr, &neigh->ip, sizeof(struct in6_addr)); // Target IPv6
+
+    // ICMPv6 Neighbor Solicitation (after IPv6 header)
+    struct nd_neighbor_solicit *ns = (struct nd_neighbor_solicit *)
+                                     (buffer + ETH_HLEN + sizeof(struct ipv6hdr));
+    ns->nd_ns_type = ND_NEIGHBOR_SOLICIT;
+    ns->nd_ns_code = 0;
+    ns->nd_ns_cksum = 0; // Will calculate the checksum below
+    ns->nd_ns_reserved = 0;
+    memcpy(&ns->nd_ns_target, &neigh->ip, sizeof(struct in6_addr));
+
+    // ICMPv6 option - Source Link-Layer Address (after NS)
+    unsigned char *opt = (unsigned char *)(buffer + ETH_HLEN
+                                           + sizeof(struct ipv6hdr)
+                                           + sizeof(struct nd_neighbor_solicit));
+    opt[0] = 1; // Option type: Source Link-Layer Address
+    opt[1] = 1; // Option length in units of 8 octets
+    memcpy(opt + 2, src->link->mac, ETH_ALEN); // Source MAC address
+
+    // Pseudo-header for checksum calculation
+    struct {
+        struct in6_addr src;
+        struct in6_addr dst;
+        uint32_t length;
+        uint8_t zeros[3];
+        uint8_t next_header;
+    } pseudo_header;
+
+    memset(&pseudo_header, 0, sizeof(pseudo_header));
+    memcpy(&pseudo_header.src, &ip6->saddr, sizeof(struct in6_addr));
+    memcpy(&pseudo_header.dst, &ip6->daddr, sizeof(struct in6_addr));
+    pseudo_header.length = htonl(sizeof(struct nd_neighbor_solicit) + 8);
+    pseudo_header.next_header = IPPROTO_ICMPV6;
+
+    // Calculate the checksum
+    uint8_t pseudo_buffer[sizeof(pseudo_header) +
+                          sizeof(struct nd_neighbor_solicit) + 8];
+    memcpy(pseudo_buffer, &pseudo_header, sizeof(pseudo_header));
+    memcpy(pseudo_buffer + sizeof(pseudo_header), ns,
+           sizeof(struct nd_neighbor_solicit) + 8);
+
+    ns->nd_ns_cksum = checksum(pseudo_buffer, sizeof(pseudo_buffer));
+
+    // Set up the destination address for sending
+    struct sockaddr_ll dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sll_family = AF_PACKET;
+    dest_addr.sll_protocol = htons(ETH_P_IPV6);
+    dest_addr.sll_halen = ETH_ALEN;
+    memcpy(dest_addr.sll_addr, neigh->mac, ETH_ALEN);
+    dest_addr.sll_ifindex = src->link->ifindex;
+
+    // Send the Neighbor Solicitation message
+    if (sendto(env.packet_fd, buffer, sizeof(buffer), 0,
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        pr_err(errno, "Neighbor Solicitation send failed");
+        return -1;
+    }
+
+    pr_debug("Neighbor Solicitation (NS) sent to IP: %s from nic: %s\n",
+             neigh->ip_str, src->link->ifname);
+    return 0;
+}
+
+static int send_arp_request(struct neigh_cache *neigh)
+{
+    struct link_network_cache *src = neigh->sending_link_network;
+    unsigned char buffer[ETH_HLEN + sizeof(struct ether_arp)];
+
+    in_addr_t src_ip = src->ip.s6_addr32[3];
+    in_addr_t dst_ip = neigh->ip.s6_addr32[3];
+
+    // Zero out the buffer
+    memset(buffer, 0, sizeof(buffer));
+
+    // Ethernet header
+    struct ethhdr *eth = (struct ethhdr *)buffer;
+    memcpy(eth->h_dest, neigh->mac, 6);       // Target MAC address
+    memcpy(eth->h_source, src->link->mac, 6); // Source MAC address
+    eth->h_proto = htons(ETH_P_ARP);          // ARP protocol
+
+    // ARP header
+    struct ether_arp *arp = (struct ether_arp *)(buffer + ETH_HLEN);
+    arp->ea_hdr.ar_hrd = htons(ARPHRD_ETHER);    // Hardware type (Ethernet)
+    arp->ea_hdr.ar_pro = htons(ETH_P_IP);        // Protocol type (IPv4)
+    arp->ea_hdr.ar_hln = ETH_ALEN;               // Hardware address length
+    arp->ea_hdr.ar_pln = sizeof(struct in_addr); // Protocol address length
+    arp->ea_hdr.ar_op = htons(ARPOP_REQUEST);    // ARP operation (request)
+
+    // Fill ARP request details
+    memcpy(arp->arp_sha, src->link->mac, ETH_ALEN); // Sender MAC address
+    memcpy(arp->arp_spa, &src_ip, sizeof(src_ip));  // Sender IP address
+    memset(arp->arp_tha, 0, ETH_ALEN);              // Target MAC address (unknown)
+    memcpy(arp->arp_tpa, &dst_ip, sizeof(dst_ip));  // Target IP address
+
+    // Set up the destination address for sending
+    struct sockaddr_ll dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sll_family = AF_PACKET;
+    dest_addr.sll_protocol = htons(ETH_P_ARP);
+    dest_addr.sll_halen = ETH_ALEN;
+    memcpy(dest_addr.sll_addr, neigh->mac, 6);
+    dest_addr.sll_ifindex = src->link->ifindex;
+
+    // Send the ARP request using the existing socket env.packet_fd
+    if (sendto(env.packet_fd, buffer, sizeof(buffer), 0,
+               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        pr_err(errno, "ARP request send failed");
+        return -1;
+    }
+
+    pr_debug("Gratuitous ARP request sent to IP: %s from nic: %s\n",
+             neigh->ip_str, src->link->ifname);
+
+    return 0;
+}
+
+static void send_gratuitous_neighbor_request(struct neigh_cache *neigh)
+{
+    if (IN6_IS_ADDR_V4MAPPED(&neigh->ip))
+        send_arp_request(neigh);
+    else
+        send_neighbor_solicitation(neigh);
+}
+
 static int handle_neigh_add(struct netlink_neigh_cmd *cmd)
 {
     struct link_cache *link;
@@ -211,6 +382,11 @@ static int handle_neigh_add(struct netlink_neigh_cmd *cmd)
                 neigh->ip_str, neigh->mac_str,
                 link->ifname);
     }
+
+    // Send a Link layer address resolution request to check if the
+    // neighbor is still there
+    if (neigh->nud_state == NUD_STALE)
+        send_gratuitous_neighbor_request(neigh);
 
 out:
     return 0;
