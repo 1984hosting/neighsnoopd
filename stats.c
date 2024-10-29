@@ -27,6 +27,8 @@ extern GHashTable *db_lookup_addr;
 extern GHashTable *db_lookup_vlan_networkid;
 extern GHashTable *db_lookup_addr_ifindex;
 
+extern GTree *db_timer_cache;
+
 
 void stats_send_link(gpointer key, gpointer value, gpointer user_data)
 {
@@ -182,7 +184,6 @@ void stats_send_fdb(gpointer key, gpointer value, gpointer user_data)
     jsonw_end_object(jw);
 }
 
-
 void stats_send_fdbs(json_writer_t *jw)
 {
     jsonw_name(jw, "fdb");
@@ -204,6 +205,7 @@ void stats_send_neigh(gpointer key, gpointer value, gpointer user_data)
 
     jsonw_start_object(jw);
 
+    jsonw_uint_field(jw, "id", neigh->id);
     jsonw_uint_field(jw, "ifindex", neigh->ifindex);
     jsonw_string_field(jw, "mac", mac_str);
     jsonw_string_field(jw, "ip", neigh->ip_str);
@@ -236,6 +238,14 @@ void stats_send_neigh(gpointer key, gpointer value, gpointer user_data)
         jsonw_string_field(jw, "nud_state", "unknown");
         break;
     }
+    if (neigh->timer) {
+        jsonw_uint_field(jw, "timer_id", neigh->timer->id);
+        jsonw_uint_field(jw, "timer_expiry_sec",
+                         neigh->timer->timer_events->expiry.tv_sec);
+        jsonw_uint_field(jw, "timer_expiry_nsec",
+                         neigh->timer->timer_events->expiry.tv_nsec);
+    }
+
     jsonw_uint_field(jw, "update_count", neigh->update_count);
     jsonw_uint_field(jw, "reference_count", neigh->reference_count);
 
@@ -373,6 +383,70 @@ void stats_send_lookup_addr_ifindex(json_writer_t *jw)
     jsonw_end_array(jw);
 }
 
+gboolean stats_send_timer(gpointer key, gpointer value, gpointer data)
+{
+    json_writer_t *jw = (json_writer_t *)data;
+    struct timer_events *timer = (struct timer_events *)value;
+    GList *iter;
+
+    jsonw_start_object(jw);
+
+    jsonw_uint_field(jw, "id", timer->id);
+    jsonw_uint_field(jw, "expiry_sec", timer->expiry.tv_sec);
+    jsonw_uint_field(jw, "expiry_nsec", timer->expiry.tv_nsec);
+
+    jsonw_name(jw, "timer_cmds");
+    jsonw_start_array(jw);
+
+    iter = timer->timer_cmds;
+    while (iter != NULL) {
+        union timer_cmd *cmd = (union timer_cmd *)iter->data;
+
+        jsonw_start_object(jw);
+
+        jsonw_uint_field(jw, "id", cmd->neigh.id);
+        switch (cmd->base.type) {
+        case TIMER_NEIGH:
+            jsonw_string_field(jw, "type", "neigh");
+            jsonw_uint_field(jw, "neigh_id", cmd->neigh.neigh->id);
+            break;
+        default:
+            jsonw_string_field(jw, "type", "unknown");
+            break;
+        }
+
+        jsonw_end_object(jw);
+
+        iter = g_list_next(iter);
+    }
+
+    jsonw_end_array(jw);
+
+    jsonw_end_object(jw);
+
+    return false;
+}
+
+void stats_send_timers(json_writer_t *jw)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    jsonw_name(jw, "current_time");
+    jsonw_start_object(jw);
+    jsonw_uint_field(jw, "sec", now.tv_sec);
+    jsonw_uint_field(jw, "nsec", now.tv_nsec);
+    jsonw_end_object(jw);
+
+    jsonw_name(jw, "timers");
+    jsonw_start_array(jw);
+
+    g_tree_foreach(db_timer_cache, stats_send_timer, jw);
+
+    jsonw_end_array(jw);
+}
+
 int handle_stats_server_request(void)
 {
     int err = 0;
@@ -423,6 +497,7 @@ int handle_stats_server_request(void)
     stats_send_lookup_addr(wr);
     stats_send_lookup_vlan_networkid(wr);
     stats_send_lookup_addr_ifindex(wr);
+    stats_send_timers(wr);
 
     jsonw_end_object(wr);
     jsonw_destroy(&wr);

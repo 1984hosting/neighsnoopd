@@ -105,7 +105,8 @@ int format_ip_address_cidr(char *buf, size_t size, const struct in6_addr *addr,
 /*
  * Function to calculate the CIDR of an IPv6 address
  */
-int calculate_cidr(const struct in6_addr *addr) {
+int calculate_cidr(const struct in6_addr *addr)
+{
     int cidr = 0;
 
     // Check if the address is an IPv4-mapped IPv6 address
