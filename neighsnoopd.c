@@ -532,12 +532,14 @@ out:
 
 static int handle_addr_del(struct netlink_addr_cmd *cmd)
 {
-    int ret = -1;
     struct network_cache *network = cache_get_network(cmd);
+    char network_cidr_str[INET6_ADDRSTRLEN + 4]; // IPv6 address + / + prefixlen
 
     if (!network) {
-        pr_debug("Network: %s/%d not cached: Can't remove\n",
-                 network->network_str, network->prefixlen);
+        format_ip_address_cidr(network_cidr_str, sizeof(network_cidr_str),
+                            &cmd->ip, cmd->prefixlen);
+        pr_debug("Network: %s not cached: Can't remove\n",
+                 network_cidr_str);
         goto out;
     }
 
@@ -546,10 +548,8 @@ static int handle_addr_del(struct netlink_addr_cmd *cmd)
     pr_info("Cache: Removing Network: %s/%d\n", network->network_str,
             network->prefixlen);
 
-    ret = 0;
-
 out:
-    return ret;
+    return 0;
 }
 
 static int handle_link_add(struct netlink_link_cmd *cmd)
@@ -594,12 +594,10 @@ out:
 
 static int handle_link_del(struct netlink_link_cmd *cmd)
 {
-    int ret = 0;
     struct link_cache *link = cache_get_link(cmd->ifindex);
 
     if (!link) {
         pr_debug("Cache: Link: %s not cached: Can't remove\n", cmd->ifname);
-        ret = -1;
         goto out;
     }
 
@@ -608,7 +606,7 @@ static int handle_link_del(struct netlink_link_cmd *cmd)
     pr_info("Cache: Link: Removed: %s\n", cmd->ifname);
 
 out:
-    return ret;
+    return 0;
 }
 
 static int handle_netlink_cmd(union netlink_cmd *cmd)
@@ -702,6 +700,9 @@ out:
 static void main_loop(void)
 {
     struct epoll_event events[env.number_of_fds];
+    struct epoll_event event;
+    int client_offset;
+    int client_bytes_to_send;
     bool last_round = false;
 
     if (netlink_queue_send_next()) {
@@ -733,6 +734,8 @@ static void main_loop(void)
          * 2. Netlink events
          * 3. BPF ring buffer events
          * 4. Send Netlink messages from the tx queue
+         * 5. Handle stats server socket requests
+         * 6. Handle stats client socket
          */
 
         // Signal events
@@ -765,6 +768,89 @@ static void main_loop(void)
         if (netlink_queue_send_next()) {
             pr_err(errno, "Failed to send Netlink message");
             return; // Failure
+        }
+
+        // Handle server stats request
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == env.stats_server_fd) {
+                struct stat st;
+                if (handle_stats_server_request())
+                    return; // Failure
+
+                // Add the client socket to the epoll
+                event.events = EPOLLOUT | EPOLLRDHUP;
+                event.data.fd = env.stats_client_fd;
+                if (epoll_ctl(env.epoll_fd, EPOLL_CTL_ADD, env.stats_client_fd,
+                              &event) == -1) {
+                    pr_err(errno, "epoll_ctl: stats_client_fd");
+                    close(env.stats_client_fd);
+                    env.stats_client_fd = -1;
+                    close(env.memfd_fd);
+                    env.memfd_fd = -1;
+                    continue;
+                }
+                client_offset = 0;
+                if (fstat(env.memfd_fd, &st) == -1) {
+                    pr_err(errno, "fstat");
+                    return; // Failure
+                }
+                client_bytes_to_send = st.st_size;
+            }
+        }
+
+        // Handle client stats request
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == env.stats_client_fd) {
+                int bytes_read;
+                int bytes_sent;
+                char buf[4096];
+
+                // Check if the client socket has been closed or if an error
+                // occurred. Or if the client has received all the data
+                if (events[i].events & (EPOLLRDHUP | EPOLLHUP) ||
+                    client_offset == client_bytes_to_send) {
+                    // Clean up resources
+                    close(env.stats_client_fd);
+                    env.stats_client_fd = -1;
+                    close(env.memfd_fd);
+                    env.memfd_fd = -1;
+                    continue;
+                }
+
+                bytes_read = pread(env.memfd_fd, buf, sizeof(buf),
+                                   client_offset);
+                if (bytes_read == -1) {
+                    pr_err(errno, "pread");
+                    return; // Failure
+                }
+
+                bytes_sent = send(env.stats_client_fd, buf, bytes_read, 0);
+                if (bytes_sent == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                        continue;
+                    pr_err(errno, "send");
+                    return; // Failure
+                }
+
+                client_offset += bytes_sent;
+
+                if (client_offset == client_bytes_to_send) {
+                    // Remove the client socket from the epoll
+                    event.events = EPOLLOUT;
+                    event.data.fd = env.stats_client_fd;
+                    if (epoll_ctl(env.epoll_fd, EPOLL_CTL_DEL, env.stats_client_fd,
+                                  &event) == -1) {
+                        pr_err(errno, "epoll_ctl: stats_client_fd");
+                        return; // Failure
+                    }
+
+                    // Close the client socket and the memfd
+                    close(env.stats_client_fd);
+                    env.stats_client_fd = -1;
+                    close(env.memfd_fd);
+                    env.memfd_fd = -1;
+                }
+            }
         }
     }
 }
@@ -983,6 +1069,15 @@ static int setup_epoll(void)
         goto out;
     }
 
+    event.events = EPOLLIN;
+    event.data.fd = env.stats_server_fd;
+    if (epoll_ctl(env.epoll_fd, EPOLL_CTL_ADD,
+                  env.stats_server_fd, &event) == -1) {
+        perror("epoll_ctl: stats_server_fd");
+        err = errno;
+        goto out;
+    }
+
 out:
     return err;
 }
@@ -1164,9 +1259,13 @@ int main(int argc, char **argv)
         err = EXIT_FAILURE;
         goto cleanup5;
     }
-    if (setup_epoll()) {
+    if (setup_stats()) {
         err = EXIT_FAILURE;
         goto cleanup6;
+    }
+    if (setup_epoll()) {
+        err = EXIT_FAILURE;
+        goto cleanup7;
     }
 
     // Main loop
@@ -1174,6 +1273,8 @@ int main(int argc, char **argv)
 
     // Cleanup
     cleanup_epoll();
+cleanup7:
+    cleanup_stats();
 cleanup6:
     cleanup_bpf();
 cleanup5:

@@ -48,6 +48,9 @@ struct env {
     int nl_fd;
     int ringbuf_fd;
     int epoll_fd;
+    int stats_server_fd;
+    int stats_client_fd;
+    int memfd_fd;
     int number_of_fds;
 
     int packet_fd; // AF_PACKET socket
@@ -334,6 +337,11 @@ int cache_neigh_update(struct netlink_neigh_cmd *neigh);
 void cache_del_neigh(struct neigh_cache *neigh);
 int setup_cache(void);
 void cleanup_cache(void);
+
+// stats functions
+int handle_stats_server_request(void);
+int setup_stats(void);
+void cleanup_stats(void);
 
 
 // Prints info messages

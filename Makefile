@@ -10,7 +10,7 @@ VERSION_DEFINE = "\#define GIT_COMMIT \"$(GIT_COMMIT_HASH)\""
 
 GLIB_CFLAGS = $(shell pkg-config --cflags --libs glib-2.0)
 
-all: neighsnoopd
+all: neighsnoopd neighsnoop
 
 neighsnoopd.bpf.c:
 
@@ -24,10 +24,13 @@ $(VERSION_FILE):
 	@echo $(VERSION_DEFINE) > $(VERSION_FILE)
 
 neighsnoopd: neighsnoopd.bpf.skel.h neighsnoopd.c neighsnoopd.h neighsnoopd_shared.h netlink.c cache.c lib.c $(VERSION_FILE)
-	gcc -g -Wall -o neighsnoopd -D_GNU_SOURCE -I./include neighsnoopd.c netlink.c cache.c lib.c logging.c -lbpf -lmnl $(GLIB_CFLAGS)
+	gcc -g -Wall -o neighsnoopd -D_GNU_SOURCE -I./include neighsnoopd.c netlink.c cache.c lib.c stats.c logging.c lib/json_writer.c -lbpf -lmnl $(GLIB_CFLAGS)
+
+neighsnoop: neighsnoop.c
+	gcc -g -Wall -o neighsnoop neighsnoop.c
 
 clean:
-	rm -f neighsnoopd.bpf.o neighsnoopd.bpf.skel.h neighsnoopd cscope.in.out cscope.out cscope.po.out $(VERSION_FILE)
+	rm -f neighsnoopd.bpf.o neighsnoopd.bpf.skel.h neighsnoopd neighsnoop cscope.in.out cscope.out cscope.po.out $(VERSION_FILE)
 
 cscope:
 	cscope -b -R -q
