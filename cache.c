@@ -578,7 +578,8 @@ out:
     return ret;
 }
 
-static guint fdb_cache_key_hash(gconstpointer key) {
+static guint fdb_cache_key_hash(gconstpointer key)
+{
     const struct fdb_cache_key *k = key;
     guint hash = 0;
 
@@ -595,7 +596,8 @@ static guint fdb_cache_key_hash(gconstpointer key) {
     return hash;
 }
 
-static gboolean fdb_cache_key_equal(gconstpointer left, gconstpointer right) {
+static gboolean fdb_cache_key_equal(gconstpointer left, gconstpointer right)
+{
     const struct fdb_cache_key *key_left = left;
     const struct fdb_cache_key *key_right = right;
 
@@ -727,7 +729,7 @@ static guint neigh_cache_key_hash(gconstpointer key)
     guint hash = 0;
 
     // Hash the ifindex
-    hash = hash * 31 + g_int_hash(&k->ifindex);
+    hash = hash * 31 + k->ifindex;
 
     // Hash the IP address
     for (guint i = 0; i < sizeof(k->ip); i++)
@@ -740,6 +742,11 @@ static gboolean neigh_cache_key_equal(gconstpointer left, gconstpointer right)
 {
     const struct neigh_cache_key *key_left = left;
     const struct neigh_cache_key *key_right = right;
+    char ip_str_left[INET6_ADDRSTRLEN];
+    char ip_str_right[INET6_ADDRSTRLEN];
+
+    format_ip_address(ip_str_left, sizeof(ip_str_left), &key_left->ip);
+    format_ip_address(ip_str_right, sizeof(ip_str_right), &key_right->ip);
 
     // Compare ifindex
     if (key_left->ifindex != key_right->ifindex)
@@ -757,6 +764,7 @@ struct neigh_cache *cache_add_neigh(struct link_network_cache *link_network,
 {
     struct neigh_cache *cache;
     struct neigh_cache_key *key;
+    static __u64 id = 1;
 
     key = g_new0(struct neigh_cache_key, 1);
     if (!key) {
@@ -773,6 +781,7 @@ struct neigh_cache *cache_add_neigh(struct link_network_cache *link_network,
         goto err1;
     }
 
+    cache->ifindex = neigh_cmd->ifindex;
     memcpy(cache->mac, neigh_cmd->mac, ETH_ALEN);
     memcpy(&cache->ip, &neigh_cmd->ip, sizeof(cache->ip));
     mac_to_string(cache->mac_str, cache->mac, sizeof(cache->mac_str));
@@ -788,6 +797,8 @@ struct neigh_cache *cache_add_neigh(struct link_network_cache *link_network,
     cache->times.referenced = cache->times.created;
 
     g_hash_table_insert(db_neigh_cache, key, cache);
+
+    cache->id = id++;
 
     return cache;
 err2:
@@ -874,6 +885,7 @@ void cache_del_neigh(struct neigh_cache *neigh)
     memcpy(&key.ip, &neigh->ip, sizeof(key.ip));
 
     g_hash_table_remove(db_neigh_cache, &key);
+    g_free(neigh);
 }
 
 // Cache setup and cleanup functions
@@ -923,7 +935,7 @@ int setup_cache(void)
     }
 
     db_neigh_cache = g_hash_table_new_full(neigh_cache_key_hash, neigh_cache_key_equal,
-                                           g_free, g_free);
+                                           g_free, NULL);
     if (!db_neigh_cache) {
         pr_err(errno, "g_hash_table_new");
         goto err6;

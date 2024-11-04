@@ -97,6 +97,7 @@ static const struct argp_option opts[] = {
 };
 
 static bool filter_deny_interfaces(char *ifname);
+static int new_neigh_timer(struct neigh_cache *neigh);
 
 // Callback function to handle data from the BPF ring buffer
 static int handle_neighbor_reply(void *ctx, void *data, size_t data_sz)
@@ -105,6 +106,7 @@ static int handle_neighbor_reply(void *ctx, void *data, size_t data_sz)
     struct link_network_cache *link_net;
     struct link_cache *link;
     struct fdb_cache *fdb;
+    struct neigh_cache *neigh;
     __u8 mac_str[MAC_ADDR_STR_LEN];
     char ip_str[INET6_ADDRSTRLEN];
 
@@ -139,6 +141,17 @@ static int handle_neighbor_reply(void *ctx, void *data, size_t data_sz)
     format_ip_address(ip_str, sizeof(ip_str), &neighbor_reply->ip);
     pr_debug("Neighbor Reply: IP: %s MAC: %s nic: %s\n",
             ip_str, mac_str, link->ifname);
+
+    neigh = cache_get_neigh_by_reply(neighbor_reply, link->ifindex);
+    if (neigh) {
+
+        // Remove old timer
+        if (neigh->timer)
+            timer_remove_event((union timer_cmd *)neigh->timer);
+        // Add a new timer
+        if (new_neigh_timer(neigh))
+            return 1;
+    }
 
     // Make the neighbor entry reachable in the Linux kernel's neighbor table
     // This will also prompt a Netlink reply from the kernel that we will use to
@@ -319,6 +332,92 @@ static void send_gratuitous_neighbor_request(struct neigh_cache *neigh)
         send_neighbor_solicitation(neigh);
 }
 
+int handle_timer_neigh_event(struct timer_neigh_cmd *cmd)
+{
+    send_gratuitous_neighbor_request(cmd->neigh);
+    cmd->neigh->timer = NULL; // Remove the timer reference
+    return 0;
+}
+
+int handle_timer_event(union timer_cmd *cmd)
+{
+    int ret = -1;
+    switch (cmd->base.type) {
+        case TIMER_NEIGH:
+            ret = handle_timer_neigh_event(&cmd->neigh);
+            break;
+        default:
+            pr_err(0, "Unknown timer event\n");
+            break;
+    }
+    return ret;
+}
+
+static int get_next_gratuitous_time(struct neigh_cache *neigh,
+                                       double *seconds)
+{
+    int ret = -1;
+    struct link_cache *link = neigh->sending_link_network->link;
+    double base_reachable_time;
+    char path[PATH_MAX];
+    bool is_ipv4 = IN6_IS_ADDR_V4MAPPED(&neigh->ip);
+    FILE *fp;
+
+    snprintf(path, sizeof(path),
+             "/proc/sys/net/%s/neigh/%s/base_reachable_time_ms",
+             is_ipv4 ? "ipv4" : "ipv6",
+             link->ifname);
+
+    fp = fopen(path, "r");
+    if (!fp) {
+        pr_err(errno, "Failed to open %s", path);
+        goto out0;
+    }
+
+    if (fscanf(fp, "%lf", &base_reachable_time) != 1) {
+        pr_err(errno, "Failed to read %s", path);
+        goto out1;
+    }
+
+    /*
+     * Our primary aim is to send gratuitous neighbor requests before the
+     * kernel changes the nud state to STALE. Therefore, we will change the
+     * time to one-fourth of the base_reachable_time and add a random time of
+     * up to two seconds to prevent too many gratuitous requests from happening
+     * simultaneously. This is an arbitrary choice for the time.
+     */
+    *seconds = base_reachable_time / 4.0 / 1000.0 +
+        (rand() % 2000) / 1000.0;
+
+    ret = 0;
+
+out1:
+    fclose(fp);
+out0:
+    return ret;
+}
+
+static int new_neigh_timer(struct neigh_cache *neigh)
+{
+    double next_gratuitous_time;
+    if (get_next_gratuitous_time(neigh, &next_gratuitous_time))
+        return -1;
+
+    if (timer_add_neigh(neigh, next_gratuitous_time)) {
+        pr_err(0, "Failed to add timer for Neigh: IP: %s MAC: %s\n",
+               neigh->ip_str, neigh->mac_str);
+        return -1;
+    }
+
+    pr_debug("Neigh: IP: %s MAC: %s nic: %s added timer for %f seconds\n",
+             neigh->ip_str, neigh->mac_str,
+             neigh->sending_link_network->link->ifname,
+             next_gratuitous_time);
+
+    return 0;
+
+}
+
 static int handle_neigh_add(struct netlink_neigh_cmd *cmd)
 {
     struct link_cache *link;
@@ -369,8 +468,7 @@ static int handle_neigh_add(struct netlink_neigh_cmd *cmd)
 
     neigh = cache_get_neigh(cmd);
     if (neigh) { // Already cached
-        if (neigh->nud_state != cmd->nud_state)
-            cache_neigh_update(cmd);
+        cache_neigh_update(cmd);
     } else { // Create a new cache entry
         neigh = cache_add_neigh(link_net, cmd);
         if (!neigh) {
@@ -382,6 +480,14 @@ static int handle_neigh_add(struct netlink_neigh_cmd *cmd)
                 neigh->ip_str, neigh->mac_str,
                 link->ifname);
     }
+
+    // Add a timer to send a gratuitous neighbor request
+    if (neigh->nud_state == NUD_REACHABLE && !neigh->timer) {
+        if (new_neigh_timer(neigh))
+            goto out;
+    } else if (neigh->nud_state == NUD_REACHABLE)
+        pr_debug("Neigh: IP: %s MAC: %s nic: %s already has a timer\n",
+                 neigh->ip_str, neigh->mac_str, link->ifname);
 
     // Send a Link layer address resolution request to check if the
     // neighbor is still there
@@ -398,6 +504,11 @@ static int handle_neigh_del(struct netlink_neigh_cmd *cmd)
 
     if (!neigh) // Not cached
         goto out;
+
+    if (neigh->timer) {
+        timer_remove_event((union timer_cmd *)neigh->timer);
+        neigh->timer = NULL;
+    }
 
     cache_del_neigh(neigh);
 
@@ -731,11 +842,12 @@ static void main_loop(void)
         /*
          * We priorities the events from epoll as follows:
          * 1. Signal events
-         * 2. Netlink events
-         * 3. BPF ring buffer events
-         * 4. Send Netlink messages from the tx queue
-         * 5. Handle stats server socket requests
-         * 6. Handle stats client socket
+         * 2. Handle timer events
+         * 3. Netlink events
+         * 4. BPF ring buffer events
+         * 5. Send Netlink messages from the tx queue
+         * 6. Handle stats server socket requests
+         * 7. Handle stats client socket
          */
 
         // Signal events
@@ -743,6 +855,16 @@ static void main_loop(void)
             if (events[i].data.fd == env.signal_fd) {
                 if (handle_signal())
                     return; // Failure or exiting
+            }
+        }
+
+        // Handle timer events
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == env.timerfd_fd) {
+                if (handle_timer_events()) {
+                    pr_err(0, "Failed to process timer events");
+                    return; // Failure
+                }
             }
         }
 
@@ -1069,6 +1191,15 @@ static int setup_epoll(void)
         goto out;
     }
 
+    // Add timerfd to epoll
+    event.events = EPOLLIN;
+    event.data.fd = env.timerfd_fd;
+    if (epoll_ctl(env.epoll_fd, EPOLL_CTL_ADD, env.timerfd_fd, &event) == -1) {
+        perror("epoll_ctl: timerfd_fd");
+        err = errno;
+        goto out;
+    }
+
     event.events = EPOLLIN;
     event.data.fd = env.stats_server_fd;
     if (epoll_ctl(env.epoll_fd, EPOLL_CTL_ADD,
@@ -1259,13 +1390,17 @@ int main(int argc, char **argv)
         err = EXIT_FAILURE;
         goto cleanup5;
     }
-    if (setup_stats()) {
+    if (setup_timerfd()) {
         err = EXIT_FAILURE;
         goto cleanup6;
     }
-    if (setup_epoll()) {
+    if (setup_stats()) {
         err = EXIT_FAILURE;
         goto cleanup7;
+    }
+    if (setup_epoll()) {
+        err = EXIT_FAILURE;
+        goto cleanup8;
     }
 
     // Main loop
@@ -1273,8 +1408,10 @@ int main(int argc, char **argv)
 
     // Cleanup
     cleanup_epoll();
-cleanup7:
+cleanup8:
     cleanup_stats();
+cleanup7:
+    cleanup_timerfd();
 cleanup6:
     cleanup_bpf();
 cleanup5:

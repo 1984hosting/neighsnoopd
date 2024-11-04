@@ -48,6 +48,7 @@ struct env {
     int nl_fd;
     int ringbuf_fd;
     int epoll_fd;
+    int timerfd_fd;
     int stats_server_fd;
     int stats_client_fd;
     int memfd_fd;
@@ -230,6 +231,7 @@ struct neigh_cache_key {
 };
 
 struct neigh_cache {
+    __u64 id;
     __u8 mac[ETH_ALEN];
     __u8 mac_str[MAC_ADDR_STR_LEN];
     __u32 ifindex; // Used for debugging
@@ -238,6 +240,7 @@ struct neigh_cache {
     struct in6_addr ip;
     char ip_str[INET6_ADDRSTRLEN];
     int nud_state;
+    struct timer_neigh_cmd *timer;
 
     int update_count;
     int reference_count;
@@ -251,6 +254,36 @@ struct neigh_cache {
 enum cache_reference {
     CACHE_NO_REFERENCE,
     CACHE_REFERENCE,
+};
+
+enum timer_type {
+    TIMER_NONE,
+    TIMER_NEIGH,
+};
+
+// Timer commands
+struct timer_events {
+    __u64 id;
+    struct timespec expiry;
+    GList *timer_cmds;
+};
+
+struct timer_base_cmd {
+    enum timer_type type;
+    __u64 id;
+    struct timer_events *timer_events;
+};
+
+struct timer_neigh_cmd {
+    enum timer_type type;
+    __u64 id;
+    struct timer_events *timer_events;
+    struct neigh_cache *neigh;
+};
+
+union timer_cmd {
+    struct timer_base_cmd base;
+    struct timer_neigh_cmd neigh;
 };
 
 void mac_to_string(__u8 *buffer, const __u8 *mac, size_t buffer_size);
@@ -337,6 +370,15 @@ int cache_neigh_update(struct netlink_neigh_cmd *neigh);
 void cache_del_neigh(struct neigh_cache *neigh);
 int setup_cache(void);
 void cleanup_cache(void);
+
+// Timer functions
+int handle_timer_event(union timer_cmd *cmd);
+int handle_timer_events(void);
+int timer_add_neigh(struct neigh_cache *neigh, double seconds);
+int timer_remove_event(union timer_cmd *cmd);
+int setup_timerfd(void);
+void cleanup_timerfd(void);
+
 
 // stats functions
 int handle_stats_server_request(void);

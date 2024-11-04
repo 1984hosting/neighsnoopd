@@ -14,7 +14,8 @@
 #define SOCKET_PATH "/run/neighsnoopd.sock"
 #define BUFFER_SIZE 4096
 
-int main(void) {
+int main(void)
+{
     int client_fd;
     int count;
     struct sockaddr_un addr;
